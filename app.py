@@ -110,6 +110,21 @@ def generate_data():
                         cdays=round(pd_*np.random.uniform(0.6,1.3),1)
                         act+=cdays
 
+                # リギング特有：差し戻し要因の内訳（実際のパイプラインで頻出する3類型）
+                #   ウェイト不良＝スキニング（ウェイトペイント）起因、補正シェイプ不足＝デフォーメーションの局所破綻、
+                #   検証NG＝命名規則・参照エラー・パフォーマンス予算超過（自動チェックで検出）
+                rework_cause = None
+                if stg=="リギング" and rev>0:
+                    rework_cause = random.choices(
+                        ["ウェイト不良","補正シェイプ不足","検証NG"], weights=[.5,.3,.2])[0]
+
+                # リギング特有：パブリッシュ後、アニメーション工程で使用中に不具合が発覚し
+                # リギングまで差し戻される「逆流」パターン（実務でよく起きるが、通常は可視化されない）
+                downstream_recall=False
+                if stg=="リギング" and random.random()<0.09:
+                    downstream_recall=True
+                    act+=round(np.random.uniform(1.0,3.0),1)
+
                 end= cur+timedelta(days=act)
                 rows.append({"shot_id":f"CUT_{sid:04d}","project":pr["name"],
                     "type":pr["type"],"stage":stg,"stage_idx":si,"artist":art,
@@ -117,6 +132,7 @@ def generate_data():
                     "delay":max(0.0,act-pd_),"is_late":act>pd_+.5,
                     "hold":hold,"hold_days":hold_days,
                     "client_review":cfg["client"],"client_reject":creject,"client_days":cdays,
+                    "rework_cause":rework_cause,"downstream_recall":downstream_recall,
                     "start":cur,"end":end})
                 cur=end
                 prev_reworked = rev>0 or creject
@@ -233,12 +249,102 @@ def make_dfg(fdf, stages):
     return fig
 
 # ── TASK-LEVEL DFG（工程内・業務手順のドリルダウン） ────────
+def _draw_loop(fig, pos, src, dst, rate, label, color, side, depth, NW, NH):
+    sx,sy = pos[src]; dx,dy = pos[dst]
+    if side=="below":
+        path=f"M {sx} {sy-NH} C {sx} {sy-NH-depth} {dx} {dy-NH-depth} {dx} {dy-NH}"
+        ly = -NH-depth-0.17
+        base_y = min(sy,dy)
+    else:
+        path=f"M {sx} {sy+NH} C {sx} {sy+NH+depth} {dx} {dy+NH+depth} {dx} {dy+NH}"
+        ly = NH+depth+0.17
+        base_y = max(sy,dy)
+    fig.add_shape(type="path",path=path,
+        line=dict(color=color,width=2,dash="dot"),layer="above")
+    mx=(sx+dx)/2
+    fig.add_annotation(x=mx, y=base_y+ly,
+        text=f"↩ {label} {rate:.0%}",showarrow=False,
+        font=dict(size=9,color=color),bgcolor="rgba(255,255,255,0.92)",borderpad=2)
+
 def make_task_dfg(stage, sdf):
     cfg = TASK_CONFIG[stage]
     n = sdf["shot_id"].nunique()
 
     fig = go.Figure()
     NW, NH = 1.05, 0.30
+
+    # ── リギング専用：実際のパイプライン手順に基づく詳細フロー ──
+    if stage=="リギング":
+        hold_rate = sdf["hold"].mean()
+        hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
+        weight_rate     = (sdf["rework_cause"]=="ウェイト不良").mean()
+        corrective_rate = (sdf["rework_cause"]=="補正シェイプ不足").mean()
+        validation_rate = (sdf["rework_cause"]=="検証NG").mean()
+        recall_rate     = sdf["downstream_recall"].mean()
+
+        nodes = ["保留\n(モデル確定待ち)","スケルトン配置","スキニング\n(ウェイトペイント)",
+                 "コントロールリグ\n構築","デフォーメーション\nテスト","リグ検証\n(自動チェック)",
+                 "パブリッシュ\n(アニメーターへ)"]
+        stats = {
+            "保留\n(モデル確定待ち)": f"発生率 {hold_rate:.0%} | 平均{hold_avg:.1f}日",
+            "スケルトン配置": f"n={n} | ジョイント配置・階層構築",
+            "スキニング\n(ウェイトペイント)": f"最重要工程 | ウェイト不良差し戻し {weight_rate:.0%}",
+            "コントロールリグ\n構築": f"IK/FK・コントローラ実装 | 差し戻し {corrective_rate:.0%}",
+            "デフォーメーション\nテスト": "ストレスポーズでの変形検証",
+            "リグ検証\n(自動チェック)": f"命名・参照・性能チェック | NG {validation_rate:.0%}",
+            "パブリッシュ\n(アニメーターへ)": f"引き渡し完了 | 事後差し戻し {recall_rate:.0%}",
+        }
+        loops = [
+            dict(src="デフォーメーション\nテスト",dst="スキニング\n(ウェイトペイント)",
+                 rate=weight_rate,label="差し戻し(ウェイト不良)",color=WARN,side="below",depth=0.55),
+            dict(src="デフォーメーション\nテスト",dst="コントロールリグ\n構築",
+                 rate=corrective_rate,label="差し戻し(補正シェイプ不足)",color=WARN,side="below",depth=0.95),
+            dict(src="リグ検証\n(自動チェック)",dst="コントロールリグ\n構築",
+                 rate=validation_rate,label="差し戻し(検証NG:命名/性能)",color=WARN,side="below",depth=0.55),
+            dict(src="パブリッシュ\n(アニメーターへ)",dst="スキニング\n(ウェイトペイント)",
+                 rate=recall_rate,label="アニメーション工程からの差し戻し(逆流)",
+                 color=ACCENT,side="above",depth=0.85),
+        ]
+
+        k = len(nodes)
+        xs = [1.2 + i*2.35 for i in range(k)]
+        pos = {node:(xs[i],1.0) for i,node in enumerate(nodes)}
+
+        fig.update_layout(
+            height=430, margin=dict(t=8,b=8,l=8,r=8),
+            paper_bgcolor="white", plot_bgcolor="white",
+            xaxis=dict(range=[-0.3, xs[-1]+2.0],showgrid=False,zeroline=False,showticklabels=False),
+            yaxis=dict(range=[-1.75,2.35],showgrid=False,zeroline=False,showticklabels=False),
+            showlegend=False, font=dict(family="Yu Gothic UI")
+        )
+
+        for i in range(k-1):
+            a,b = nodes[i], nodes[i+1]
+            ax,ay = pos[a]; bx,by = pos[b]
+            fig.add_annotation(x=bx-NW,y=by,ax=ax+NW,ay=ay,
+                xref="x",yref="y",axref="x",ayref="y",
+                arrowhead=2,arrowsize=1.2,arrowwidth=2.4,
+                arrowcolor=STEEL,showarrow=True,text="")
+
+        for lp in loops:
+            _draw_loop(fig, pos, lp["src"], lp["dst"], lp["rate"], lp["label"],
+                       lp["color"], lp["side"], lp["depth"], NW, NH)
+
+        for node in nodes:
+            x,y = pos[node]
+            if "パブリッシュ" in node: fill=GREEN
+            elif "保留" in node:       fill=MGRAY
+            elif "スキニング" in node: fill=STEEL
+            else:                      fill=NAVY
+            fig.add_shape(type="rect",
+                x0=x-NW,y0=y-NH,x1=x+NW,y1=y+NH,
+                fillcolor=fill,line=dict(color="white",width=1.5),layer="above")
+            fig.add_annotation(x=x,y=y+0.10,text=f"<b>{node}</b>",
+                showarrow=False,font=dict(size=9.5,color="white"),align="center")
+            fig.add_annotation(x=x,y=y-NH-0.16,text=stats.get(node,""),
+                showarrow=False,font=dict(size=8.5,color=MGRAY),align="center")
+
+        return fig
 
     if cfg["render"]:
         nodes = ["レンダリング実行","レンダーチェック","承認\n(次工程へ)"]
@@ -339,7 +445,7 @@ with st.sidebar:
     projs = ["全プロジェクト"] + sorted(df["project"].unique())
     sel   = st.selectbox("プロジェクト選択", projs)
     st.divider()
-    phase_sel = st.selectbox("業務手順ドリルダウン：工程選択", STAGES, index=5)
+    phase_sel = st.selectbox("業務手順ドリルダウン：工程選択", STAGES, index=2)
     st.divider()
     api_key = st.text_input("Claude API Key", type="password", placeholder="sk-ant-...")
     st.caption("AI分析機能の利用に必要です")
@@ -416,6 +522,43 @@ st.markdown("<div class='subsec'>ShotGrid等のタスク管理ツールを想定
 sdf_task = fdf[fdf["stage"]==phase_sel]
 fig_task = make_task_dfg(phase_sel, sdf_task)
 st.plotly_chart(fig_task, use_container_width=True)
+
+if phase_sel=="リギング":
+    st.markdown("<div class='subsec' style='margin-top:14px'>リギング特化インサイト："
+                "実際のタスク管理ツールで検出できる3つの差し戻し要因＋通常は見えない「逆流」パターン</div>",
+                unsafe_allow_html=True)
+    rg = sdf_task
+    w_rate = (rg["rework_cause"]=="ウェイト不良").mean()
+    c_rate = (rg["rework_cause"]=="補正シェイプ不足").mean()
+    v_rate = (rg["rework_cause"]=="検証NG").mean()
+    r_rate = rg["downstream_recall"].mean()
+
+    rg1,rg2,rg3,rg4 = st.columns(4)
+    with rg1:
+        st.markdown(f"""<div class='issue-card'>
+            <div class='issue-title'>ウェイト不良</div>
+            <div class='issue-body'>差し戻し率 <span class='issue-num'>{w_rate:.0%}</span><br>
+            スキニング工程の品質ばらつきが最大の手戻り要因。ウェイトペイントの標準化・
+            レビュー観点の明文化が効果的。</div></div>""", unsafe_allow_html=True)
+    with rg2:
+        st.markdown(f"""<div class='issue-card'>
+            <div class='issue-title'>補正シェイプ不足</div>
+            <div class='issue-body'>差し戻し率 <span class='issue-num'>{c_rate:.0%}</span><br>
+            肘・膝・肩などの局所的な変形破綻。ストレスポーズでの
+            早期検証が手戻り削減の鍵。</div></div>""", unsafe_allow_html=True)
+    with rg3:
+        st.markdown(f"""<div class='issue-card'>
+            <div class='issue-title'>検証NG(命名/性能)</div>
+            <div class='issue-body'>差し戻し率 <span class='issue-num'>{v_rate:.0%}</span><br>
+            命名規則違反・参照エラー・パフォーマンス予算超過。
+            自動チェックスクリプトで人手レビュー前に検出可能。</div></div>""", unsafe_allow_html=True)
+    with rg4:
+        st.markdown(f"""<div class='issue-card' style='border-top-color:{ACCENT}'>
+            <div class='issue-title'>逆流(アニメーション工程から)</div>
+            <div class='issue-body'>発生率 <span class='issue-num'>{r_rate:.0%}</span><br>
+            パブリッシュ後、実際にアニメーターが動かして初めて発覚する不具合。
+            通常のガントチャートでは見えず、プロセスマイニングで初めて可視化できる部分。</div></div>""",
+            unsafe_allow_html=True)
 
 # ── CG業界特有の経営課題 ────────────────────────────────
 st.markdown("<div class='sec'>CG業界特有の経営課題（データから検出）</div>", unsafe_allow_html=True)
@@ -540,6 +683,12 @@ if st.button("▶ AI診断を実行", type="primary"):
 ・属人化：{top_artist['artist']} にショットが集中
 ・クライアントレビュー差し戻し率：{c_reject_rate:.0%}（平均{c_extra_days:.1f}日/回の追加）
 ・上流工程の手戻りによる下流保留率：{hold_rate2:.0%}（平均{hold_days_avg:.1f}日/件）
+
+【リギング工程：差し戻し要因の内訳】
+・ウェイト不良（スキニング起因）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='ウェイト不良').mean():.0%}
+・補正シェイプ不足（デフォーメーション破綻）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='補正シェイプ不足').mean():.0%}
+・検証NG（命名/性能）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='検証NG').mean():.0%}
+・アニメーション工程からの逆流（パブリッシュ後の事後差し戻し）：{fdf[fdf['stage']=='リギング']['downstream_recall'].mean():.0%}
 
 【遅延上位5ショット】
 {top5.to_string(index=False)}
