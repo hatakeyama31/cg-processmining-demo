@@ -120,10 +120,11 @@ def generate_data():
 
                 # リギング特有：パブリッシュ後、アニメーション工程で使用中に不具合が発覚し
                 # リギングまで差し戻される「逆流」パターン（実務でよく起きるが、通常は可視化されない）
-                downstream_recall=False
+                downstream_recall=False; recall_days=0.0
                 if stg=="リギング" and random.random()<0.09:
                     downstream_recall=True
-                    act+=round(np.random.uniform(1.0,3.0),1)
+                    recall_days=round(np.random.uniform(1.0,3.0),1)
+                    act+=recall_days
 
                 end= cur+timedelta(days=act)
                 rows.append({"shot_id":f"CUT_{sid:04d}","project":pr["name"],
@@ -133,6 +134,7 @@ def generate_data():
                     "hold":hold,"hold_days":hold_days,
                     "client_review":cfg["client"],"client_reject":creject,"client_days":cdays,
                     "rework_cause":rework_cause,"downstream_recall":downstream_recall,
+                    "recall_days":recall_days,
                     "start":cur,"end":end})
                 cur=end
                 prev_reworked = rev>0 or creject
@@ -273,7 +275,7 @@ def make_task_dfg(stage, sdf):
     fig = go.Figure()
     NW, NH = 1.05, 0.30
 
-    # ── リギング専用：実際のパイプライン手順に基づく詳細フロー ──
+    # ── リギング専用：実際のパイプライン手順に基づく詳細フロー（縦型） ──
     if stage=="リギング":
         hold_rate = sdf["hold"].mean()
         hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
@@ -282,77 +284,122 @@ def make_task_dfg(stage, sdf):
         validation_rate = (sdf["rework_cause"]=="検証NG").mean()
         recall_rate     = sdf["downstream_recall"].mean()
 
-        nodes = ["保留\n(モデル確定待ち)","スケルトン配置","スキニング\n(ウェイトペイント)",
-                 "コントロールリグ\n構築","デフォーメーション\nテスト","リグ検証\n(自動チェック)",
-                 "パブリッシュ\n(アニメーターへ)"]
-        stats = {
-            "保留\n(モデル確定待ち)": f"発生率 {hold_rate:.0%} | 平均{hold_avg:.1f}日",
-            "スケルトン配置": f"n={n} | ジョイント配置・階層構築",
-            "スキニング\n(ウェイトペイント)": f"最重要工程 | ウェイト不良差し戻し {weight_rate:.0%}",
-            "コントロールリグ\n構築": f"IK/FK・コントローラ実装 | 差し戻し {corrective_rate:.0%}",
-            "デフォーメーション\nテスト": "ストレスポーズでの変形検証",
-            "リグ検証\n(自動チェック)": f"命名・参照・性能チェック | NG {validation_rate:.0%}",
-            "パブリッシュ\n(アニメーターへ)": f"引き渡し完了 | 事後差し戻し {recall_rate:.0%}",
-        }
-        loops = [
-            dict(src="デフォーメーション\nテスト",dst="スキニング\n(ウェイトペイント)",
-                 rate=weight_rate,label="差し戻し(ウェイト不良)",color=WARN,side="below",depth=0.55),
-            dict(src="デフォーメーション\nテスト",dst="コントロールリグ\n構築",
-                 rate=corrective_rate,label="差し戻し(補正シェイプ不足)",color=WARN,side="below",depth=0.95),
-            dict(src="リグ検証\n(自動チェック)",dst="コントロールリグ\n構築",
-                 rate=validation_rate,label="差し戻し(検証NG:命名/性能)",color=WARN,side="below",depth=0.55),
-            dict(src="パブリッシュ\n(アニメーターへ)",dst="スキニング\n(ウェイトペイント)",
-                 rate=recall_rate,label="アニメーション工程からの差し戻し(逆流)",
-                 color=ACCENT,side="above",depth=0.85),
-        ]
+        BW, BH = 2.05, 0.42   # ボックス半幅・半高（テキストが収まる十分な幅を確保）
 
-        k = len(nodes)
-        xs = [1.2 + i*2.35 for i in range(k)]
-        pos = {node:(xs[i],1.0) for i,node in enumerate(nodes)}
+        # メインフロー（上から下へ）＋「逆流」は独立ノードとして右側に配置
+        main = [
+            ("hold",   "保留（モデル確定待ち）", 9.6),
+            ("skel",   "スケルトン配置",         8.0),
+            ("skin",   "スキニング（ウェイトペイント）", 6.4),
+            ("ctrl",   "コントロールリグ構築",    4.8),
+            ("deform", "デフォーメーションテスト", 3.2),
+            ("valid",  "リグ検証（自動チェック）", 1.6),
+            ("pub",    "パブリッシュ（アニメーターへ）", 0.0),
+        ]
+        pos = {key:(0.0,y) for key,label,y in main}
+        label_of = {key:label for key,label,y in main}
+        recall_key = "recall"
+        pos[recall_key] = (4.3, 0.0)
+        label_of[recall_key] = "アニメーション工程で<br>不具合発覚（逆流）"
+
+        stats = {
+            "hold":   f"発生率 {hold_rate:.0%}　平均待機 {hold_avg:.1f}日",
+            "skel":   f"通過 n={n}　ジョイント配置・階層構築",
+            "skin":   f"最重要工程　ウェイト不良差し戻し {weight_rate:.0%}",
+            "ctrl":   f"IK/FK・コントローラ実装　差し戻し {corrective_rate:.0%}",
+            "deform": "ストレスポーズでの変形検証",
+            "valid":  f"命名・参照・性能チェック　NG率 {validation_rate:.0%}",
+            "pub":    f"引き渡し完了",
+            "recall": f"発生率 {recall_rate:.0%}",
+        }
 
         fig.update_layout(
-            height=430, margin=dict(t=8,b=8,l=8,r=8),
+            height=880, margin=dict(t=10,b=10,l=10,r=10),
             paper_bgcolor="white", plot_bgcolor="white",
-            xaxis=dict(range=[-0.3, xs[-1]+2.0],showgrid=False,zeroline=False,showticklabels=False),
-            yaxis=dict(range=[-1.75,2.35],showgrid=False,zeroline=False,showticklabels=False),
+            xaxis=dict(range=[-2.6,7.2],showgrid=False,zeroline=False,showticklabels=False),
+            yaxis=dict(range=[-1.0,10.4],showgrid=False,zeroline=False,showticklabels=False),
             showlegend=False, font=dict(family="Yu Gothic UI")
         )
 
-        for i in range(k-1):
-            a,b = nodes[i], nodes[i+1]
-            ax,ay = pos[a]; bx,by = pos[b]
-            fig.add_annotation(x=bx-NW,y=by,ax=ax+NW,ay=ay,
+        # メインフロー矢印（上→下）
+        for i in range(len(main)-1):
+            ay = main[i][2]; by = main[i+1][2]
+            fig.add_annotation(x=0,y=by+BH,ax=0,ay=ay-BH,
                 xref="x",yref="y",axref="x",ayref="y",
-                arrowhead=2,arrowsize=1.2,arrowwidth=2.4,
+                arrowhead=2,arrowsize=1.2,arrowwidth=2.6,
                 arrowcolor=STEEL,showarrow=True,text="")
 
-        for lp in loops:
-            _draw_loop(fig, pos, lp["src"], lp["dst"], lp["rate"], lp["label"],
-                       lp["color"], lp["side"], lp["depth"], NW, NH)
+        # 差し戻しループ（右側のレーンに分離。ループが長いほど外側のレーンを使う＝交差しない）
+        def rework_lane(src_key,dst_key,rate,label,color,lane_x):
+            sx,sy = pos[src_key]; dx,dy = pos[dst_key]
+            fig.add_shape(type="path",
+                path=f"M {BW} {sy} L {lane_x} {sy} L {lane_x} {dy}",
+                line=dict(color=color,width=2,dash="dot"),layer="above")
+            fig.add_annotation(x=BW,y=dy,ax=lane_x,ay=dy,
+                xref="x",yref="y",axref="x",ayref="y",
+                arrowhead=2,arrowsize=1.1,arrowwidth=2,
+                arrowcolor=color,showarrow=True,text="")
+            fig.add_annotation(x=lane_x+0.14, y=(sy+dy)/2, text=f"↩ {label}<br>{rate:.0%}",
+                showarrow=False, font=dict(size=9,color=color), align="left",
+                bgcolor="rgba(255,255,255,0.94)", borderpad=2, xanchor="left")
 
-        for node in nodes:
-            x,y = pos[node]
-            if "パブリッシュ" in node: fill=GREEN
-            elif "保留" in node:       fill=MGRAY
-            elif "スキニング" in node: fill=STEEL
-            else:                      fill=NAVY
+        rework_lane("deform","ctrl",  corrective_rate, "補正シェイプ不足", "#2E7D6B", 2.55)
+        rework_lane("deform","skin",  weight_rate,      "ウェイト不良",     WARN,     3.35)
+        rework_lane("valid", "ctrl",  validation_rate,  "検証NG(命名/性能)","#6B7A90", 2.55)
+
+        # 逆流（アニメーション工程からの差し戻し）：独立ノードを経由する専用ルート
+        fig.add_annotation(x=pos[recall_key][0]-BW*0.55,y=0,ax=BW,ay=0,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=1.1,arrowwidth=2,
+            arrowcolor=ACCENT,showarrow=True,text="")
+        fig.add_shape(type="path",
+            path=f"M {pos[recall_key][0]} {0.0+0.42} L {pos[recall_key][0]} {6.4} L {BW} {6.4}",
+            line=dict(color=ACCENT,width=2,dash="dot"),layer="above")
+        fig.add_annotation(x=BW,y=6.4,ax=pos[recall_key][0],ay=6.4,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=1.1,arrowwidth=2,
+            arrowcolor=ACCENT,showarrow=True,text="")
+        fig.add_annotation(x=pos[recall_key][0]+1.55,y=3.2,
+            text=f"↩ 逆流でスキニングへ<br>差し戻し {recall_rate:.0%}",
+            showarrow=False,font=dict(size=9,color=ACCENT),align="left",
+            bgcolor="rgba(255,255,255,0.94)",borderpad=2,xanchor="left")
+
+        # ノード描画
+        for key,label,y in main:
+            fill = (GREEN if key=="pub" else MGRAY if key=="hold" else
+                    STEEL if key=="skin" else NAVY)
             fig.add_shape(type="rect",
-                x0=x-NW,y0=y-NH,x1=x+NW,y1=y+NH,
+                x0=-BW,y0=y-BH,x1=BW,y1=y+BH,
                 fillcolor=fill,line=dict(color="white",width=1.5),layer="above")
-            fig.add_annotation(x=x,y=y+0.10,text=f"<b>{node}</b>",
-                showarrow=False,font=dict(size=9.5,color="white"),align="center")
-            fig.add_annotation(x=x,y=y-NH-0.16,text=stats.get(node,""),
-                showarrow=False,font=dict(size=8.5,color=MGRAY),align="center")
+            fig.add_annotation(x=0,y=y+0.12,text=f"<b>{label}</b>",
+                showarrow=False,font=dict(size=11.5,color="white"),align="center")
+            fig.add_annotation(x=0,y=y-0.16,text=stats[key],
+                showarrow=False,font=dict(size=9,color="rgba(255,255,255,0.88)"),align="center")
+
+        rx,ry = pos[recall_key]
+        fig.add_shape(type="rect",
+            x0=rx-1.85,y0=ry-BH,x1=rx+1.85,y1=ry+BH,
+            fillcolor=ACCENT,line=dict(color="white",width=1.5),layer="above")
+        fig.add_annotation(x=rx,y=ry+0.12,text=f"<b>{label_of[recall_key]}</b>",
+            showarrow=False,font=dict(size=10,color="white"),align="center")
+        fig.add_annotation(x=rx,y=ry-0.20,text=stats["recall"],
+            showarrow=False,font=dict(size=9,color="rgba(255,255,255,0.9)"),align="center")
+
+        # 凡例
+        fig.add_annotation(x=-2.3,y=10.15,xref="x",yref="y",xanchor="left",
+            text=(f"■通常フロー(青)　■ウェイト不良(橙)　■補正シェイプ不足(緑)　"
+                  f"■検証NG(灰)　■逆流＝アニメーション工程から(紫)"),
+            showarrow=False,font=dict(size=9.5,color=MGRAY))
 
         return fig
 
     if cfg["render"]:
-        nodes = ["レンダリング実行","レンダーチェック","承認\n(次工程へ)"]
+        nodes = ["レンダリング実行","レンダーチェック","承認<br>(次工程へ)"]
         err_rate = (sdf["revision"]>0).mean()
         stats = {
             "レンダリング実行": f"n={n} | 平均{sdf['planned'].mean():.1f}日想定",
             "レンダーチェック": f"エラー再実行率 {err_rate:.0%}",
-            "承認\n(次工程へ)": "完了",
+            "承認<br>(次工程へ)": "完了",
         }
         loops = [("レンダーチェック","レンダリング実行", err_rate, "NG: 再レンダリング")]
     else:
@@ -361,8 +408,8 @@ def make_task_dfg(stage, sdf):
         if cfg["upstream"] is not None:
             hold_rate = sdf["hold"].mean()
             hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
-            nodes.append("保留\n(上流アセット待ち)")
-            stats["保留\n(上流アセット待ち)"] = f"発生率 {hold_rate:.0%} | 平均{hold_avg:.1f}日"
+            nodes.append("保留<br>(上流アセット待ち)")
+            stats["保留<br>(上流アセット待ち)"] = f"発生率 {hold_rate:.0%} | 平均{hold_avg:.1f}日"
 
         nodes.append("作業")
         stats["作業"] = f"n={n} | 平均{sdf['planned'].mean():.1f}日想定"
@@ -374,13 +421,13 @@ def make_task_dfg(stage, sdf):
         loops = [("内部レビュー","作業", int_rate, "差し戻し(内部QC)")]
 
         if cfg["client"]:
-            nodes.append(f"クライアントレビュー\n({cfg['client_label']})")
+            nodes.append(f"クライアントレビュー<br>({cfg['client_label']})")
             c_rate = sdf["client_reject"].mean()
-            stats[f"クライアントレビュー\n({cfg['client_label']})"] = f"差し戻し率 {c_rate:.0%}"
-            loops.append((f"クライアントレビュー\n({cfg['client_label']})","作業", c_rate, "差し戻し(クライアント)"))
+            stats[f"クライアントレビュー<br>({cfg['client_label']})"] = f"差し戻し率 {c_rate:.0%}"
+            loops.append((f"クライアントレビュー<br>({cfg['client_label']})","作業", c_rate, "差し戻し(クライアント)"))
 
-        nodes.append("承認\n(次工程へ)")
-        stats["承認\n(次工程へ)"] = "完了"
+        nodes.append("承認<br>(次工程へ)")
+        stats["承認<br>(次工程へ)"] = "完了"
 
     k = len(nodes)
     xs = [1.2 + i*2.6 for i in range(k)]
@@ -434,6 +481,56 @@ def make_task_dfg(stage, sdf):
             showarrow=False,font=dict(size=9,color=MGRAY),align="center")
 
     return fig
+
+# ── TASK-LEVEL イベント件数・スループット統計（標準的なPM指標） ──
+def build_task_table(stage, sdf):
+    cfg = TASK_CONFIG[stage]
+    n = sdf["shot_id"].nunique()
+    rework_days_series = (sdf.loc[sdf["revision"]>0,"revision"] * sdf.loc[sdf["revision"]>0,"planned"] * 0.55)
+    avg_rework_days = rework_days_series.mean() if len(rework_days_series) else 0.0
+    rows = []
+
+    if stage=="リギング":
+        hold_rate = sdf["hold"].mean()
+        hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
+        weight_rate     = (sdf["rework_cause"]=="ウェイト不良").mean()
+        corrective_rate = (sdf["rework_cause"]=="補正シェイプ不足").mean()
+        validation_rate = (sdf["rework_cause"]=="検証NG").mean()
+        recall_rate     = sdf["downstream_recall"].mean()
+        recall_days     = sdf.loc[sdf["downstream_recall"],"recall_days"].mean() if sdf["downstream_recall"].any() else 0.0
+        n_hold=round(n*hold_rate); n_w=round(n*weight_rate); n_c=round(n*corrective_rate)
+        n_v=round(n*validation_rate); n_r=round(n*recall_rate)
+        rows = [
+            ("保留（モデル確定待ち）", n_hold, f"{hold_avg:.1f}", f"{hold_rate:.0%}"),
+            ("スケルトン配置", n, "-", "-"),
+            ("スキニング（ウェイトペイント）", n+n_w+n_r, f"{avg_rework_days:.1f}", f"{weight_rate:.0%}"),
+            ("コントロールリグ構築", n+n_c+n_v, f"{avg_rework_days:.1f}", f"{corrective_rate+validation_rate:.0%}"),
+            ("デフォーメーションテスト", n+n_w+n_c, "-", "-"),
+            ("リグ検証（自動チェック）", n+n_v, "-", f"{validation_rate:.0%}"),
+            ("パブリッシュ（アニメーターへ）", n+n_r, f"{recall_days:.1f}", f"{recall_rate:.0%}"),
+        ]
+    elif cfg["render"]:
+        err_rate=(sdf["revision"]>0).mean(); n_e=round(n*err_rate)
+        rows = [
+            ("レンダリング実行", n+n_e, f"{avg_rework_days:.1f}", f"{err_rate:.0%}"),
+            ("レンダーチェック", n, "-", "-"),
+            ("承認（次工程へ）", n, "-", "-"),
+        ]
+    else:
+        int_rate=(sdf["revision"]>0).mean(); n_i=round(n*int_rate)
+        if cfg["upstream"] is not None:
+            hold_rate=sdf["hold"].mean()
+            hold_avg=sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
+            rows.append(("保留（上流アセット待ち）", round(n*hold_rate), f"{hold_avg:.1f}", f"{hold_rate:.0%}"))
+        rows.append(("作業", n, "-", "-"))
+        rows.append(("内部レビュー", n+n_i, f"{avg_rework_days:.1f}", f"{int_rate:.0%}"))
+        if cfg["client"]:
+            c_rate=sdf["client_reject"].mean(); n_cr=round(n*c_rate)
+            c_days=sdf.loc[sdf["client_reject"],"client_days"].mean() if sdf["client_reject"].any() else 0.0
+            rows.append((f"クライアントレビュー（{cfg['client_label']}）", n+n_cr, f"{c_days:.1f}", f"{c_rate:.0%}"))
+        rows.append(("承認（次工程へ）", n, "-", "-"))
+
+    return pd.DataFrame(rows, columns=["業務ステップ","通過件数（頻度）","平均追加日数/回","差し戻し・保留 発生率"])
 
 # ── SIDEBAR ───────────────────────────────────────────
 with st.sidebar:
@@ -522,6 +619,12 @@ st.markdown("<div class='subsec'>ShotGrid等のタスク管理ツールを想定
 sdf_task = fdf[fdf["stage"]==phase_sel]
 fig_task = make_task_dfg(phase_sel, sdf_task)
 st.plotly_chart(fig_task, use_container_width=True)
+
+st.markdown("<div class='subsec' style='margin-top:4px'>工程別イベント件数・スループット"
+            "（頻度はループによる再訪問を含む／プロセスマイニングの標準指標）</div>",
+            unsafe_allow_html=True)
+tbl = build_task_table(phase_sel, sdf_task)
+st.dataframe(tbl, hide_index=True, use_container_width=True)
 
 if phase_sel=="リギング":
     st.markdown("<div class='subsec' style='margin-top:14px'>リギング特化インサイト："
