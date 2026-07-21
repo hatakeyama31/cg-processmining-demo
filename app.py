@@ -8,15 +8,15 @@ import random
 import requests
 
 st.set_page_config(
-    page_title="NeXT Diagnostics – CG制作プロセス分析",
-    page_icon="🎬", layout="wide",
+    page_title="NeXT Diagnostics – 支払業務プロセス分析",
+    page_icon="💰", layout="wide",
     initial_sidebar_state="expanded"
 )
 
 NAVY  = "#1A2B45"; STEEL = "#3F7AB0"; PALE  = "#EBF3FA"
 WARN  = "#C05A20"; GREEN = "#1A6B3C"; LGRAY = "#F3F5F8"; MGRAY = "#7A8A9A"
-ACCENT= "#8E3B6B"  # クライアント差し戻し・重篤な例外用
-CLR   = dict(NAVY=NAVY,STEEL=STEEL,PALE=PALE,WARN=WARN,GREEN=GREEN,MGRAY=MGRAY)
+ACCENT= "#8E3B6B"
+AMBER = "#B8860B"; TEAL="#2E7D6B"; SLATE="#5C6B7A"
 
 st.markdown(f"""<style>
   .main .block-container{{padding-top:1.5rem}}
@@ -29,6 +29,9 @@ st.markdown(f"""<style>
   .kpi-sub{{font-size:11px;color:#AAB5C0;margin-top:3px}}
   .sec{{font-size:14px;font-weight:600;color:{NAVY};border-left:4px solid {STEEL};
         padding-left:10px;margin:16px 0 10px}}
+  .stepnum{{display:inline-block;background:{NAVY};color:white;border-radius:50%;
+        width:22px;height:22px;text-align:center;line-height:22px;font-size:12px;
+        font-weight:700;margin-right:8px}}
   .subsec{{font-size:12px;font-weight:600;color:{MGRAY};margin:2px 0 8px 2px}}
   .ai-box{{background:{PALE};border-radius:10px;padding:1.4rem 1.6rem;
            border:1px solid #C0D4E8;line-height:1.8;font-size:14px}}
@@ -41,533 +44,372 @@ st.markdown(f"""<style>
   .issue-num{{font-size:22px;font-weight:700;color:{ACCENT};margin-right:4px}}
 </style>""", unsafe_allow_html=True)
 
-# ── PHASES（工程レベル・俯瞰） ─────────────────────────────
-STAGES = ["要求仕様定義","モデリング","リギング","テクスチャリング",
-          "レイアウト","アニメーション","ライティング","レンダリング","品質チェック"]
-PLAN  = {"要求仕様定義":2,"モデリング":5,"リギング":3,"テクスチャリング":4,
-         "レイアウト":3,"アニメーション":8,"ライティング":4,"レンダリング":2,"品質チェック":2}
-REVRT = {"要求仕様定義":.10,"モデリング":.20,"リギング":.12,"テクスチャリング":.18,
-         "レイアウト":.15,"アニメーション":.44,"ライティング":.29,"レンダリング":.16,"品質チェック":.22}
-
-# ── TASK CONFIG（工程内・業務手順レベル） ─────────────────
-# ShotGrid / Flow Production Trackingのタスク管理を想定：
-#   各工程は「作業 → 内部レビュー → (承認 or 差し戻し)」を基本ユニットとし、
-#   クライアントレビューが入る工程、上流工程の手戻りが波及して保留が発生する工程を区別する。
-TASK_CONFIG = {
-    "要求仕様定義":   dict(upstream=None,        client=False, client_label=None,       render=False, client_base=0.0),
-    "モデリング":     dict(upstream=None,        client=True,  client_label="コンセプト確認", render=False, client_base=0.15),
-    "リギング":       dict(upstream="モデリング", client=False, client_label=None,       render=False, client_base=0.0),
-    "テクスチャリング": dict(upstream="モデリング", client=False, client_label=None,       render=False, client_base=0.0),
-    "レイアウト":     dict(upstream=None,        client=True,  client_label="構図確認",   render=False, client_base=0.18),
-    "アニメーション": dict(upstream="レイアウト", client=True,  client_label="芝居確認",   render=False, client_base=0.28),
-    "ライティング":   dict(upstream=None,        client=False, client_label=None,       render=False, client_base=0.0),
-    "レンダリング":   dict(upstream=None,        client=False, client_label=None,       render=True,  client_base=0.0),
-    "品質チェック":   dict(upstream=None,        client=True,  client_label="最終承認",   render=False, client_base=0.10),
+# ── 不一致パターンの定義（現状の事実情報のみ。AIの関与はここには含めない） ──
+EXC_TYPES = {
+    "数量差異":   dict(color=WARN,  dept="発注部門", days=(2.5,4.8), rejoin=True,
+                       desc="発注した数量と、検収・請求書の数量が異なる"),
+    "価格差異":   dict(color=AMBER, dept="購買部門", days=(3.2,6.0), rejoin=True,
+                       desc="発注時点の価格と、請求書の価格が異なる"),
+    "検収未登録": dict(color=TEAL,  dept="倉庫",     days=(1.2,3.5), rejoin=True,
+                       desc="請求書は届いているが、検収の記録がまだない"),
+    "重複請求書": dict(color=SLATE, dept="経理担当", days=(0.5,1.5), rejoin=False,
+                       desc="同じ内容の請求書が二重に届いている"),
 }
 
-# ── DATA（工程レベル + タスクレベルの状態フラグを同時生成） ──
+# ── 改善提案側でのみ使うAIアクション定義（現状フローには含めない） ──
+AI_ACTIONS = {
+    "数量差異":   dict(ai="仕入先への確認メールを<br>自動ドラフト",
+                       human="発注部門が内容確認の<br>うえ送信"),
+    "価格差異":   dict(ai="発注・請求の差額と変更<br>履歴を自動整理",
+                       human="購買担当が価格変更<br>合意の有無を確認"),
+    "検収未登録": dict(ai="倉庫の入荷記録へ<br>自動照会",
+                       human="倉庫担当が実物確認の<br>うえ検収登録"),
+    "重複請求書": dict(ai="過去の支払履歴と自動<br>照合し重複スコア算出",
+                       human="経理担当が最終確認の<br>うえ棄却"),
+}
+
+# ── DATA ──────────────────────────────────────────────
 @st.cache_data
 def generate_data():
-    random.seed(42); np.random.seed(42)
-    PROJS = [
-        {"id":"P01","name":"PROJECT ALPHA","type":"TVアニメ","n":80},
-        {"id":"P02","name":"PROJECT NOVA", "type":"劇場版",  "n":50},
-        {"id":"P03","name":"PROJECT ECHO", "type":"OVA",    "n":40},
-    ]
-    ARTISTS = [f"Artist {c}" for c in "ABCDEFGH"]
-    rows = []; sid = 1
-    for pr in PROJS:
-        base = datetime(2025,4,1)
-        for _ in range(pr["n"]):
-            cx  = random.choices(["低","中","高"], weights=[.3,.5,.2])[0]
-            art = random.choice(ARTISTS)
-            cur = base + timedelta(days=random.randint(0,90))
-            prev_reworked = False  # 直前工程で内部差し戻しがあったか（保留判定に利用）
-            for si,stg in enumerate(STAGES):
-                cfg = TASK_CONFIG[stg]
-                pd_= PLAN[stg]; m={"低":.7,"中":1.0,"高":1.5}[cx]
-                act= max(1.0, pd_*m+np.random.normal(0,pd_*.28))
+    random.seed(7); np.random.seed(7)
+    VENDORS = [f"取引先{c}" for c in "ABCDEFGHIJ"]
+    DEPTS_BUY = ["資材調達課","生産管理課","設備管理課"]
+    n = 620
+    rows = []
+    base = datetime(2025,10,1)
+    match_choices = ["一致"] + list(EXC_TYPES.keys())
+    # Ardent Partners "AP Metrics That Matter 2025" 等のベンチマークに基づき、
+    # 平均的な企業の請求書例外率は概ね20%前後（ベストプラクティス企業は一桁台）とされる。
+    # ここでは典型的な中小企業を想定し、例外率合計 約20% で構成する。
+    weights = [0.80, 0.07, 0.06, 0.05, 0.02]
+    for i in range(n):
+        vendor = random.choice(VENDORS)
+        buy_dept = random.choice(DEPTS_BUY)
+        po_amount = round(np.random.lognormal(mean=11.5, sigma=1.0),0)
+        result = random.choices(match_choices, weights=weights)[0]
+        invoice_date = base + timedelta(days=random.randint(0,150))
 
-                # 内部差し戻し（既存ロジック踏襲）
-                rev= 0
-                if random.random()<REVRT[stg]:
-                    rev= random.choices([1,2,3],weights=[.55,.3,.15])[0]
-                    act+= rev*pd_*.55
+        if result=="一致":
+            resolve_days = round(np.random.uniform(0.2,0.8),1)
+            ai_used=False; rejected=False
+        else:
+            lo,hi = EXC_TYPES[result]["days"]
+            resolve_days = round(np.random.uniform(lo,hi),1)
+            ai_used = random.random()<0.82
+            rejected = (result=="重複請求書")
 
-                # 保留（上流工程の手戻り波及によるアセット待ち）
-                hold=False; hold_days=0.0
-                if cfg["upstream"] is not None:
-                    hp = 0.55 if prev_reworked else 0.07
-                    if random.random()<hp:
-                        hold=True; hold_days=round(np.random.uniform(1.0,4.0),1)
-                        act+=hold_days
+        amount_band = "少額" if po_amount<300000 else ("中額" if po_amount<1500000 else "高額")
+        pattern_match = np.clip(np.random.beta(5,2) if result!="一致" else np.random.beta(6,1.5),0,1)
 
-                # クライアントレビュー差し戻し
-                creject=False; cdays=0.0
-                if cfg["client"]:
-                    if random.random()<cfg["client_base"]:
-                        creject=True
-                        cdays=round(pd_*np.random.uniform(0.6,1.3),1)
-                        act+=cdays
-
-                # リギング特有：差し戻し要因の内訳（実際のパイプラインで頻出する3類型）
-                #   ウェイト不良＝スキニング（ウェイトペイント）起因、補正シェイプ不足＝デフォーメーションの局所破綻、
-                #   検証NG＝命名規則・参照エラー・パフォーマンス予算超過（自動チェックで検出）
-                rework_cause = None
-                if stg=="リギング" and rev>0:
-                    rework_cause = random.choices(
-                        ["ウェイト不良","補正シェイプ不足","検証NG"], weights=[.5,.3,.2])[0]
-
-                # リギング特有：パブリッシュ後、アニメーション工程で使用中に不具合が発覚し
-                # リギングまで差し戻される「逆流」パターン（実務でよく起きるが、通常は可視化されない）
-                downstream_recall=False; recall_days=0.0
-                if stg=="リギング" and random.random()<0.09:
-                    downstream_recall=True
-                    recall_days=round(np.random.uniform(1.0,3.0),1)
-                    act+=recall_days
-
-                end= cur+timedelta(days=act)
-                rows.append({"shot_id":f"CUT_{sid:04d}","project":pr["name"],
-                    "type":pr["type"],"stage":stg,"stage_idx":si,"artist":art,
-                    "complexity":cx,"planned":pd_,"actual":act,"revision":rev,
-                    "delay":max(0.0,act-pd_),"is_late":act>pd_+.5,
-                    "hold":hold,"hold_days":hold_days,
-                    "client_review":cfg["client"],"client_reject":creject,"client_days":cdays,
-                    "rework_cause":rework_cause,"downstream_recall":downstream_recall,
-                    "recall_days":recall_days,
-                    "start":cur,"end":end})
-                cur=end
-                prev_reworked = rev>0 or creject
-            sid+=1
+        rows.append({
+            "invoice_id": f"INV{i+1:05d}", "vendor": vendor, "buy_dept": buy_dept,
+            "po_amount": po_amount, "amount_band": amount_band,
+            "match_result": result, "resolve_days": resolve_days,
+            "ai_used": ai_used, "rejected": rejected,
+            "pattern_match": round(pattern_match,2),
+            "invoice_date": invoice_date,
+        })
     return pd.DataFrame(rows)
 
 df = generate_data()
 
-# ── DFG NETWORK GRAPH（工程レベル・俯瞰） ─────────────────
-def make_dfg(fdf, stages):
-    ALL  = stages + ["承認完了"]
-    top  = stages[:5]
-    bot  = stages[5:]
+# ── ①現状プロセス可視化（プロセスマイニング。AI要素は含めない） ──
+def make_asis_flow(fdf):
+    n = len(fdf)
+    match_rate = (fdf["match_result"]=="一致").mean()
 
-    pos = {}
-    for i,s in enumerate(top): pos[s] = (1.0+i*2.2, 1.8)
-    for i,s in enumerate(bot):  pos[s] = (9.8-i*2.2, 0.2)
-    pos["承認完了"] = (1.0, 0.2)
+    BW, BH = 2.6, 0.78
+    FS_MAIN, FS_SUB, FS_LEGEND = 20, 14, 13.5
 
-    ns = fdf.groupby("stage").agg(
-        n   =("shot_id","nunique"),
-        act =("actual","mean"),
-        pln =("planned","mean"),
-        rev =("revision",lambda x:(x>0).mean()),
-    ).reset_index().set_index("stage")
-
-    NW, NH = 0.92, 0.23
+    trunk = [
+        ("order", "発注",                    14.0),
+        ("uke",   "検収",                    11.2),
+        ("check", "請求書チェック<br>（発注・検収と照合）", 8.0),
+        ("appr",  "支払確認",                -2.6),
+        ("pay",   "支払実行",                -5.0),
+    ]
+    pos = {k:(0.0,y) for k,_,y in trunk}
 
     fig = go.Figure()
     fig.update_layout(
-        height=390, margin=dict(t=8,b=36,l=8,r=8),
+        height=1450, margin=dict(t=10,b=10,l=10,r=10),
         paper_bgcolor="white", plot_bgcolor="white",
-        xaxis=dict(range=[-0.5,12.0],showgrid=False,zeroline=False,showticklabels=False),
-        yaxis=dict(range=[-0.85,2.65],showgrid=False,zeroline=False,showticklabels=False),
-        showlegend=False,
-        font=dict(family="Yu Gothic UI")
-    )
-
-    for i in range(len(ALL)-1):
-        a,b = ALL[i],ALL[i+1]
-        if a not in pos or b not in pos: continue
-        ax,ay = pos[a]; bx,by = pos[b]
-        n_c = int(ns.loc[a,"n"]) if a in ns.index else 50
-        w   = max(1.5, min(5.0, n_c/20))
-
-        if abs(ay-by)>0.3:
-            sx_,sy_ = ax, ay-NH
-            ex_,ey_ = bx, by+NH
-        elif bx < ax:
-            sx_,sy_ = ax-NW, ay
-            ex_,ey_ = bx+NW, by
-        else:
-            sx_,sy_ = ax+NW, ay
-            ex_,ey_ = bx-NW, by
-
-        fig.add_annotation(x=ex_,y=ey_,ax=sx_,ay=sy_,
-            xref="x",yref="y",axref="x",ayref="y",
-            arrowhead=2,arrowsize=1.2,arrowwidth=w,
-            arrowcolor=STEEL,showarrow=True,text="")
-
-        mx=(ax+bx)/2; my=(ay+by)/2+(0.18 if abs(ay-by)<0.3 else 0)
-        if a in ns.index:
-            fig.add_annotation(x=mx,y=my,
-                text=f"{ns.loc[a,'act']:.1f}日",
-                showarrow=False,font=dict(size=8,color=MGRAY),
-                bgcolor="rgba(255,255,255,0.85)",borderpad=2)
-
-    for s in stages:
-        if s not in pos or s not in ns.index: continue
-        if ns.loc[s,"rev"] < 0.13: continue
-        x,y = pos[s]; r = ns.loc[s,"rev"]
-        if y>1.0:
-            path=f"M {x+NW} {y+NH} C {x+NW*2.2} {y+0.72} {x-NW*0.6} {y+0.72} {x-NW} {y+NH}"
-            ly=y+0.60
-        else:
-            path=f"M {x+NW} {y-NH} C {x+NW*2.2} {y-0.72} {x-NW*0.6} {y-0.72} {x-NW} {y-NH}"
-            ly=y-0.60
-        fig.add_shape(type="path",path=path,
-            line=dict(color=WARN,width=2,dash="dot"),layer="above")
-        fig.add_annotation(x=x+0.1,y=ly,
-            text=f"↩ {r:.0%}",showarrow=False,
-            font=dict(size=9,color=WARN),bgcolor="rgba(255,255,255,0.88)",borderpad=2)
-
-    for s in ALL:
-        if s not in pos: continue
-        x,y = pos[s]
-        if s=="承認完了":
-            fill=GREEN
-        elif s in ns.index:
-            pct=(ns.loc[s,"act"]-ns.loc[s,"pln"])/ns.loc[s,"pln"]
-            fill=WARN if pct>0.30 else STEEL if pct>0.10 else NAVY
-        else:
-            fill=NAVY
-
-        fig.add_shape(type="rect",
-            x0=x-NW,y0=y-NH,x1=x+NW,y1=y+NH,
-            fillcolor=fill,line=dict(color="white",width=1.5),layer="above")
-
-        lbl = s if len(s)<=7 else s[:6]+"…"
-        fig.add_annotation(x=x,y=y+0.07,text=f"<b>{lbl}</b>",
-            showarrow=False,font=dict(size=10,color="white"))
-        if s in ns.index:
-            fig.add_annotation(x=x,y=y-0.09,
-                text=f"n={int(ns.loc[s,'n'])} | {ns.loc[s,'act']:.1f}日",
-                showarrow=False,font=dict(size=8,color="rgba(255,255,255,0.85)"))
-        elif s=="承認完了":
-            fig.add_annotation(x=x,y=y-0.09,text="完了",
-                showarrow=False,font=dict(size=8,color="rgba(255,255,255,0.85)"))
-
-    fig.add_annotation(x=0,y=-0.75,xref="x",yref="y",
-        text="🟦 標準　🟠 ボトルネック（計画比+30%超）　🟩 完了　⤾ リビジョンループ（発生率）",
-        showarrow=False,font=dict(size=9,color=MGRAY))
-
-    return fig
-
-# ── TASK-LEVEL DFG（工程内・業務手順のドリルダウン） ────────
-def _draw_loop(fig, pos, src, dst, rate, label, color, side, depth, NW, NH):
-    sx,sy = pos[src]; dx,dy = pos[dst]
-    if side=="below":
-        path=f"M {sx} {sy-NH} C {sx} {sy-NH-depth} {dx} {dy-NH-depth} {dx} {dy-NH}"
-        ly = -NH-depth-0.17
-        base_y = min(sy,dy)
-    else:
-        path=f"M {sx} {sy+NH} C {sx} {sy+NH+depth} {dx} {dy+NH+depth} {dx} {dy+NH}"
-        ly = NH+depth+0.17
-        base_y = max(sy,dy)
-    fig.add_shape(type="path",path=path,
-        line=dict(color=color,width=2,dash="dot"),layer="above")
-    mx=(sx+dx)/2
-    fig.add_annotation(x=mx, y=base_y+ly,
-        text=f"↩ {label} {rate:.0%}",showarrow=False,
-        font=dict(size=9,color=color),bgcolor="rgba(255,255,255,0.92)",borderpad=2)
-
-def make_task_dfg(stage, sdf):
-    cfg = TASK_CONFIG[stage]
-    n = sdf["shot_id"].nunique()
-
-    fig = go.Figure()
-    NW, NH = 1.05, 0.30
-
-    # ── リギング専用：実際のパイプライン手順に基づく詳細フロー（縦型） ──
-    if stage=="リギング":
-        hold_rate = sdf["hold"].mean()
-        hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
-        weight_rate     = (sdf["rework_cause"]=="ウェイト不良").mean()
-        corrective_rate = (sdf["rework_cause"]=="補正シェイプ不足").mean()
-        validation_rate = (sdf["rework_cause"]=="検証NG").mean()
-        recall_rate     = sdf["downstream_recall"].mean()
-
-        BW, BH = 2.05, 0.42   # ボックス半幅・半高（テキストが収まる十分な幅を確保）
-
-        # メインフロー（上から下へ）＋「逆流」は独立ノードとして右側に配置
-        main = [
-            ("hold",   "保留（モデル確定待ち）", 9.6),
-            ("skel",   "スケルトン配置",         8.0),
-            ("skin",   "スキニング（ウェイトペイント）", 6.4),
-            ("ctrl",   "コントロールリグ構築",    4.8),
-            ("deform", "デフォーメーションテスト", 3.2),
-            ("valid",  "リグ検証（自動チェック）", 1.6),
-            ("pub",    "パブリッシュ（アニメーターへ）", 0.0),
-        ]
-        pos = {key:(0.0,y) for key,label,y in main}
-        label_of = {key:label for key,label,y in main}
-        recall_key = "recall"
-        pos[recall_key] = (4.3, 0.0)
-        label_of[recall_key] = "アニメーション工程で<br>不具合発覚（逆流）"
-
-        stats = {
-            "hold":   f"発生率 {hold_rate:.0%}　平均待機 {hold_avg:.1f}日",
-            "skel":   f"通過 n={n}　ジョイント配置・階層構築",
-            "skin":   f"最重要工程　ウェイト不良差し戻し {weight_rate:.0%}",
-            "ctrl":   f"IK/FK・コントローラ実装　差し戻し {corrective_rate:.0%}",
-            "deform": "ストレスポーズでの変形検証",
-            "valid":  f"命名・参照・性能チェック　NG率 {validation_rate:.0%}",
-            "pub":    f"引き渡し完了",
-            "recall": f"発生率 {recall_rate:.0%}",
-        }
-
-        fig.update_layout(
-            height=880, margin=dict(t=10,b=10,l=10,r=10),
-            paper_bgcolor="white", plot_bgcolor="white",
-            xaxis=dict(range=[-2.6,7.2],showgrid=False,zeroline=False,showticklabels=False),
-            yaxis=dict(range=[-1.0,10.4],showgrid=False,zeroline=False,showticklabels=False),
-            showlegend=False, font=dict(family="Yu Gothic UI")
-        )
-
-        # メインフロー矢印（上→下）
-        for i in range(len(main)-1):
-            ay = main[i][2]; by = main[i+1][2]
-            fig.add_annotation(x=0,y=by+BH,ax=0,ay=ay-BH,
-                xref="x",yref="y",axref="x",ayref="y",
-                arrowhead=2,arrowsize=1.2,arrowwidth=2.6,
-                arrowcolor=STEEL,showarrow=True,text="")
-
-        # 差し戻しループ（右側のレーンに分離。ループが長いほど外側のレーンを使う＝交差しない）
-        def rework_lane(src_key,dst_key,rate,label,color,lane_x):
-            sx,sy = pos[src_key]; dx,dy = pos[dst_key]
-            fig.add_shape(type="path",
-                path=f"M {BW} {sy} L {lane_x} {sy} L {lane_x} {dy}",
-                line=dict(color=color,width=2,dash="dot"),layer="above")
-            fig.add_annotation(x=BW,y=dy,ax=lane_x,ay=dy,
-                xref="x",yref="y",axref="x",ayref="y",
-                arrowhead=2,arrowsize=1.1,arrowwidth=2,
-                arrowcolor=color,showarrow=True,text="")
-            fig.add_annotation(x=lane_x+0.14, y=(sy+dy)/2, text=f"↩ {label}<br>{rate:.0%}",
-                showarrow=False, font=dict(size=9,color=color), align="left",
-                bgcolor="rgba(255,255,255,0.94)", borderpad=2, xanchor="left")
-
-        rework_lane("deform","ctrl",  corrective_rate, "補正シェイプ不足", "#2E7D6B", 2.55)
-        rework_lane("deform","skin",  weight_rate,      "ウェイト不良",     WARN,     3.35)
-        rework_lane("valid", "ctrl",  validation_rate,  "検証NG(命名/性能)","#6B7A90", 2.55)
-
-        # 逆流（アニメーション工程からの差し戻し）：独立ノードを経由する専用ルート
-        fig.add_annotation(x=pos[recall_key][0]-BW*0.55,y=0,ax=BW,ay=0,
-            xref="x",yref="y",axref="x",ayref="y",
-            arrowhead=2,arrowsize=1.1,arrowwidth=2,
-            arrowcolor=ACCENT,showarrow=True,text="")
-        fig.add_shape(type="path",
-            path=f"M {pos[recall_key][0]} {0.0+0.42} L {pos[recall_key][0]} {6.4} L {BW} {6.4}",
-            line=dict(color=ACCENT,width=2,dash="dot"),layer="above")
-        fig.add_annotation(x=BW,y=6.4,ax=pos[recall_key][0],ay=6.4,
-            xref="x",yref="y",axref="x",ayref="y",
-            arrowhead=2,arrowsize=1.1,arrowwidth=2,
-            arrowcolor=ACCENT,showarrow=True,text="")
-        fig.add_annotation(x=pos[recall_key][0]+1.55,y=3.2,
-            text=f"↩ 逆流でスキニングへ<br>差し戻し {recall_rate:.0%}",
-            showarrow=False,font=dict(size=9,color=ACCENT),align="left",
-            bgcolor="rgba(255,255,255,0.94)",borderpad=2,xanchor="left")
-
-        # ノード描画
-        for key,label,y in main:
-            fill = (GREEN if key=="pub" else MGRAY if key=="hold" else
-                    STEEL if key=="skin" else NAVY)
-            fig.add_shape(type="rect",
-                x0=-BW,y0=y-BH,x1=BW,y1=y+BH,
-                fillcolor=fill,line=dict(color="white",width=1.5),layer="above")
-            fig.add_annotation(x=0,y=y+0.12,text=f"<b>{label}</b>",
-                showarrow=False,font=dict(size=11.5,color="white"),align="center")
-            fig.add_annotation(x=0,y=y-0.16,text=stats[key],
-                showarrow=False,font=dict(size=9,color="rgba(255,255,255,0.88)"),align="center")
-
-        rx,ry = pos[recall_key]
-        fig.add_shape(type="rect",
-            x0=rx-1.85,y0=ry-BH,x1=rx+1.85,y1=ry+BH,
-            fillcolor=ACCENT,line=dict(color="white",width=1.5),layer="above")
-        fig.add_annotation(x=rx,y=ry+0.12,text=f"<b>{label_of[recall_key]}</b>",
-            showarrow=False,font=dict(size=10,color="white"),align="center")
-        fig.add_annotation(x=rx,y=ry-0.20,text=stats["recall"],
-            showarrow=False,font=dict(size=9,color="rgba(255,255,255,0.9)"),align="center")
-
-        # 凡例
-        fig.add_annotation(x=-2.3,y=10.15,xref="x",yref="y",xanchor="left",
-            text=(f"■通常フロー(青)　■ウェイト不良(橙)　■補正シェイプ不足(緑)　"
-                  f"■検証NG(灰)　■逆流＝アニメーション工程から(紫)"),
-            showarrow=False,font=dict(size=9.5,color=MGRAY))
-
-        return fig
-
-    if cfg["render"]:
-        nodes = ["レンダリング実行","レンダーチェック","承認<br>(次工程へ)"]
-        err_rate = (sdf["revision"]>0).mean()
-        stats = {
-            "レンダリング実行": f"n={n} | 平均{sdf['planned'].mean():.1f}日想定",
-            "レンダーチェック": f"エラー再実行率 {err_rate:.0%}",
-            "承認<br>(次工程へ)": "完了",
-        }
-        loops = [("レンダーチェック","レンダリング実行", err_rate, "NG: 再レンダリング")]
-    else:
-        nodes = []
-        stats = {}
-        if cfg["upstream"] is not None:
-            hold_rate = sdf["hold"].mean()
-            hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
-            nodes.append("保留<br>(上流アセット待ち)")
-            stats["保留<br>(上流アセット待ち)"] = f"発生率 {hold_rate:.0%} | 平均{hold_avg:.1f}日"
-
-        nodes.append("作業")
-        stats["作業"] = f"n={n} | 平均{sdf['planned'].mean():.1f}日想定"
-
-        nodes.append("内部レビュー")
-        int_rate = (sdf["revision"]>0).mean()
-        stats["内部レビュー"] = f"差し戻し率 {int_rate:.0%}"
-
-        loops = [("内部レビュー","作業", int_rate, "差し戻し(内部QC)")]
-
-        if cfg["client"]:
-            nodes.append(f"クライアントレビュー<br>({cfg['client_label']})")
-            c_rate = sdf["client_reject"].mean()
-            stats[f"クライアントレビュー<br>({cfg['client_label']})"] = f"差し戻し率 {c_rate:.0%}"
-            loops.append((f"クライアントレビュー<br>({cfg['client_label']})","作業", c_rate, "差し戻し(クライアント)"))
-
-        nodes.append("承認<br>(次工程へ)")
-        stats["承認<br>(次工程へ)"] = "完了"
-
-    k = len(nodes)
-    xs = [1.2 + i*2.6 for i in range(k)]
-    pos = {node:(xs[i],1.0) for i,node in enumerate(nodes)}
-
-    fig.update_layout(
-        height=330, margin=dict(t=8,b=70,l=8,r=8),
-        paper_bgcolor="white", plot_bgcolor="white",
-        xaxis=dict(range=[-0.3, xs[-1]+1.6],showgrid=False,zeroline=False,showticklabels=False),
-        yaxis=dict(range=[-0.55,1.85],showgrid=False,zeroline=False,showticklabels=False),
+        xaxis=dict(range=[-3.0,16.5],showgrid=False,zeroline=False,showticklabels=False),
+        yaxis=dict(range=[-6.0,17.0],showgrid=False,zeroline=False,showticklabels=False),
         showlegend=False, font=dict(family="Yu Gothic UI")
     )
 
-    for i in range(k-1):
-        a,b = nodes[i], nodes[i+1]
-        ax,ay = pos[a]; bx,by = pos[b]
-        fig.add_annotation(x=bx-NW,y=by,ax=ax+NW,ay=ay,
+    main_seq = ["order","uke","check"]
+    for i in range(len(main_seq)-1):
+        ay = pos[main_seq[i]][1]; by = pos[main_seq[i+1]][1]
+        fig.add_annotation(x=0,y=by+BH,ax=0,ay=ay-BH,
             xref="x",yref="y",axref="x",ayref="y",
-            arrowhead=2,arrowsize=1.2,arrowwidth=2.4,
+            arrowhead=2,arrowsize=1.2,arrowwidth=3,
             arrowcolor=STEEL,showarrow=True,text="")
 
-    for src,dst,rate,label in loops:
-        sx,sy = pos[src]; dx,dy = pos[dst]
-        is_client = "クライアント" in label
-        color = ACCENT if is_client else WARN
-        depth = 0.85 if is_client else 0.55
-        path = f"M {sx} {sy-NH} C {sx} {sy-NH-depth} {dx} {dy-NH-depth} {dx} {dy-NH}"
-        fig.add_shape(type="path",path=path,
-            line=dict(color=color,width=2,dash="dot"),layer="above")
-        mx = (sx+dx)/2
-        fig.add_annotation(x=mx, y=sy-NH-depth-0.16,
-            text=f"↩ {label} {rate:.0%}",showarrow=False,
-            font=dict(size=9,color=color),bgcolor="rgba(255,255,255,0.9)",borderpad=2)
+    fig.add_annotation(x=0,y=pos["appr"][1]+BH,ax=0,ay=pos["check"][1]-BH,
+        xref="x",yref="y",axref="x",ayref="y",
+        arrowhead=2,arrowsize=1.2,arrowwidth=4,
+        arrowcolor=GREEN,showarrow=True,text="")
+    fig.add_annotation(x=1.3,y=(pos["appr"][1]+pos["check"][1])/2,
+        text=f"内容一致 {match_rate:.0%}", showarrow=False,
+        font=dict(size=FS_SUB,color=GREEN), bgcolor="rgba(255,255,255,0.9)", borderpad=2)
 
-    for node in nodes:
-        x,y = pos[node]
-        if "承認" in node:
-            fill = GREEN
-        elif "保留" in node:
-            fill = MGRAY
-        elif "クライアント" in node:
-            fill = ACCENT
+    fig.add_annotation(x=0,y=pos["pay"][1]+BH,ax=0,ay=pos["appr"][1]-BH,
+        xref="x",yref="y",axref="x",ayref="y",
+        arrowhead=2,arrowsize=1.2,arrowwidth=3,
+        arrowcolor=STEEL,showarrow=True,text="")
+
+    # 不一致パターン別の分岐（件数・処理時間・対応部署のみを表示。AI要素は含めない）
+    # 行き（検知→各分岐）は起点をずらして扇状に、戻り（各分岐→検知）は半径の異なる
+    # 弧を使い、実際に請求書チェックの上端へ着地させることで手戻りだと分かるようにする。
+    branch_ys = {"数量差異":6.4, "価格差異":4.0, "検収未登録":1.6, "重複請求書":-0.8}
+    bx = 6.9   # 検知ボックス右端（BW=2.6）との間に十分な隙間を確保し、扇状分岐を成立させる
+    BBW, BBH = 2.0, 0.95
+    rejoin_i = 0
+    n_rejoin = sum(1 for c in EXC_TYPES.values() if c["rejoin"])
+    for idx,(exc,by) in enumerate(branch_ys.items()):
+        cfg = EXC_TYPES[exc]
+        sub = fdf[fdf["match_result"]==exc]
+        rate = len(sub)/n
+        avg_days = sub["resolve_days"].mean() if len(sub) else 0
+        color = cfg["color"]
+
+        # 検知ノードから各分岐へ（起点を右端に沿ってずらし、隙間の中で扇状に独立して伸ばす）
+        origin_y = pos['check'][1] + BH*0.8 - idx*(BH*1.6/3)
+        fig.add_annotation(x=bx-BBW,y=by,ax=BW,ay=origin_y,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=1.0,arrowwidth=2.6,
+            arrowcolor=color,showarrow=True,text="")
+
+        fig.add_shape(type="rect",x0=bx-BBW,y0=by-BBH,x1=bx+BBW,y1=by+BBH,
+            fillcolor=color,line=dict(color="white",width=1.3),layer="above")
+        fig.add_annotation(x=bx,y=by+0.55,text=f"<b>{exc}</b>",
+            showarrow=False,font=dict(size=FS_SUB,color="white"),align="center")
+        fig.add_annotation(x=bx,y=by+0.12,text=f"{cfg['dept']}が対応",
+            showarrow=False,font=dict(size=12,color="rgba(255,255,255,0.95)"),align="center")
+        fig.add_annotation(x=bx,y=by-0.35,
+            text=f"件数 {len(sub)}件（{rate:.0%}）　平均{avg_days:.1f}日",
+            showarrow=False,font=dict(size=11.5,color="rgba(255,255,255,0.95)"),align="center")
+
+        if cfg["rejoin"]:
+            # 戻り経路は「右へ抜ける→ボックス群の外側を上へ→検知ボックス上端へ」という
+            # 明確な迂回ルートにする。ボックスの上を横切らないため重ならず、
+            # 着地点も検知ボックスの上端に近接させて揃え、見た目を統一する。
+            far_x   = bx + BBW + 1.6 + rejoin_i*1.3
+            top_y   = pos['check'][1] + BH + 0.7 + rejoin_i*0.24
+            entry_x = -0.4 + rejoin_i*0.4
+            entry_y = pos['check'][1] + BH
+            sx, sy = bx+BBW, by
+            path = (f"M {sx} {sy} L {far_x} {sy} L {far_x} {top_y} "
+                    f"L {entry_x} {top_y} L {entry_x} {entry_y}")
+            fig.add_shape(type="path", path=path,
+                line=dict(color=color,width=2.4,dash="dashdot"), layer="above")
+            fig.add_annotation(x=entry_x,y=entry_y,ax=entry_x,ay=entry_y+0.3,
+                xref="x",yref="y",axref="x",ayref="y",
+                arrowhead=2,arrowsize=1.0,arrowwidth=2.4,
+                arrowcolor=color,showarrow=True,text="")
+            fig.add_annotation(x=far_x+0.15,y=(sy+top_y)/2,
+                text=f"対応後、請求書<br>チェックへ差し戻し",
+                showarrow=False,font=dict(size=10.5,color=color),align="left",xanchor="left",
+                bgcolor="rgba(255,255,255,0.88)",borderpad=1)
+            rejoin_i += 1
         else:
-            fill = NAVY
-        fig.add_shape(type="rect",
-            x0=x-NW,y0=y-NH,x1=x+NW,y1=y+NH,
+            tx = bx+BBW+2.2
+            fig.add_shape(type="path",path=f"M {bx+BBW} {by} L {tx-1.1} {by}",
+                line=dict(color=color,width=2.2),layer="above")
+            fig.add_annotation(x=tx-1.1,y=by,ax=bx+BBW,ay=by,
+                xref="x",yref="y",axref="x",ayref="y",
+                arrowhead=2,arrowsize=1.0,arrowwidth=2.2,
+                arrowcolor=color,showarrow=True,text="")
+            fig.add_shape(type="rect",x0=tx-1.1,y0=by-0.68,x1=tx+1.1,y1=by+0.68,
+                fillcolor=MGRAY,line=dict(color="white",width=1.3),layer="above")
+            fig.add_annotation(x=tx,y=by,text="<b>支払わず</b><br>棄却",
+                showarrow=False,font=dict(size=12.5,color="white"),align="center")
+
+
+    for key,label,y in trunk:
+        fill = GREEN if key in ("appr","pay") else (ACCENT if key=="check" else NAVY)
+        w = BW*1.1 if key=="check" else BW
+        fig.add_shape(type="rect",x0=-w,y0=y-BH,x1=w,y1=y+BH,
             fillcolor=fill,line=dict(color="white",width=1.5),layer="above")
-        fig.add_annotation(x=x,y=y+0.08,text=f"<b>{node}</b>",
-            showarrow=False,font=dict(size=10,color="white"),align="center")
-        fig.add_annotation(x=x,y=y-NH-0.16,text=stats.get(node,""),
-            showarrow=False,font=dict(size=9,color=MGRAY),align="center")
+        fig.add_annotation(x=0,y=y,text=f"<b>{label}</b>",
+            showarrow=False,font=dict(size=FS_MAIN,color="white"),align="center")
+
+    fig.add_annotation(x=-2.8,y=15.3,xref="x",yref="y",xanchor="left",
+        text="請求書チェックの時点で、発注・検収・請求書の内容を突き合わせる",
+        showarrow=False,font=dict(size=FS_LEGEND,color=MGRAY),align="left")
 
     return fig
 
-# ── TASK-LEVEL イベント件数・スループット統計（標準的なPM指標） ──
-def build_task_table(stage, sdf):
-    cfg = TASK_CONFIG[stage]
-    n = sdf["shot_id"].nunique()
-    rework_days_series = (sdf.loc[sdf["revision"]>0,"revision"] * sdf.loc[sdf["revision"]>0,"planned"] * 0.55)
-    avg_rework_days = rework_days_series.mean() if len(rework_days_series) else 0.0
+# ── ②課題による影響のまとめ ──────────────────────────────
+def build_impact_table(fdf):
+    n_total = len(fdf)
+    exc_df = fdf[fdf["match_result"]!="一致"]
     rows = []
+    for exc,cfg in EXC_TYPES.items():
+        sub = fdf[fdf["match_result"]==exc]
+        rows.append({
+            "不一致パターン": exc, "対応部署": cfg["dept"],
+            "件数": len(sub), "発生率": f"{len(sub)/n_total:.1%}",
+            "平均対応日数": round(sub["resolve_days"].mean(),1) if len(sub) else 0,
+            "滞留金額合計": int(sub["po_amount"].sum()),
+            "延べ対応日数": round((sub["resolve_days"]).sum(),1),
+        })
+    return pd.DataFrame(rows)
 
-    if stage=="リギング":
-        hold_rate = sdf["hold"].mean()
-        hold_avg  = sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
-        weight_rate     = (sdf["rework_cause"]=="ウェイト不良").mean()
-        corrective_rate = (sdf["rework_cause"]=="補正シェイプ不足").mean()
-        validation_rate = (sdf["rework_cause"]=="検証NG").mean()
-        recall_rate     = sdf["downstream_recall"].mean()
-        recall_days     = sdf.loc[sdf["downstream_recall"],"recall_days"].mean() if sdf["downstream_recall"].any() else 0.0
-        n_hold=round(n*hold_rate); n_w=round(n*weight_rate); n_c=round(n*corrective_rate)
-        n_v=round(n*validation_rate); n_r=round(n*recall_rate)
-        rows = [
-            ("保留（モデル確定待ち）", n_hold, f"{hold_avg:.1f}", f"{hold_rate:.0%}"),
-            ("スケルトン配置", n, "-", "-"),
-            ("スキニング（ウェイトペイント）", n+n_w+n_r, f"{avg_rework_days:.1f}", f"{weight_rate:.0%}"),
-            ("コントロールリグ構築", n+n_c+n_v, f"{avg_rework_days:.1f}", f"{corrective_rate+validation_rate:.0%}"),
-            ("デフォーメーションテスト", n+n_w+n_c, "-", "-"),
-            ("リグ検証（自動チェック）", n+n_v, "-", f"{validation_rate:.0%}"),
-            ("パブリッシュ（アニメーターへ）", n+n_r, f"{recall_days:.1f}", f"{recall_rate:.0%}"),
-        ]
-    elif cfg["render"]:
-        err_rate=(sdf["revision"]>0).mean(); n_e=round(n*err_rate)
-        rows = [
-            ("レンダリング実行", n+n_e, f"{avg_rework_days:.1f}", f"{err_rate:.0%}"),
-            ("レンダーチェック", n, "-", "-"),
-            ("承認（次工程へ）", n, "-", "-"),
-        ]
-    else:
-        int_rate=(sdf["revision"]>0).mean(); n_i=round(n*int_rate)
-        if cfg["upstream"] is not None:
-            hold_rate=sdf["hold"].mean()
-            hold_avg=sdf.loc[sdf["hold"],"hold_days"].mean() if sdf["hold"].any() else 0.0
-            rows.append(("保留（上流アセット待ち）", round(n*hold_rate), f"{hold_avg:.1f}", f"{hold_rate:.0%}"))
-        rows.append(("作業", n, "-", "-"))
-        rows.append(("内部レビュー", n+n_i, f"{avg_rework_days:.1f}", f"{int_rate:.0%}"))
-        if cfg["client"]:
-            c_rate=sdf["client_reject"].mean(); n_cr=round(n*c_rate)
-            c_days=sdf.loc[sdf["client_reject"],"client_days"].mean() if sdf["client_reject"].any() else 0.0
-            rows.append((f"クライアントレビュー（{cfg['client_label']}）", n+n_cr, f"{c_days:.1f}", f"{c_rate:.0%}"))
-        rows.append(("承認（次工程へ）", n, "-", "-"))
+# ── ③AIを使った効率化（改善提案。ここではじめてAIが登場） ──
+# To-Beフロー：請求書チェックで検知された不一致それぞれについて、
+# AIが「原因特定→下調べ・ドラフト作成」まで行い、人は最終確認・実行のみを行う。
+# 種類ごとに対応内容が異なるため、4つの独立したレーンとして表現する
+# （①のフローと同じ理由で、レーン同士が交差する線は使わない）。
+def make_tobe_flow(fdf):
+    BW, BH = 2.3, 0.7
+    lane_x = {"数量差異":-5.1, "価格差異":-1.7, "検収未登録":1.7, "重複請求書":5.1}
 
-    return pd.DataFrame(rows, columns=["業務ステップ","通過件数（頻度）","平均追加日数/回","差し戻し・保留 発生率"])
+    fig = go.Figure()
+    fig.update_layout(
+        height=1050, margin=dict(t=10,b=10,l=10,r=10),
+        paper_bgcolor="white", plot_bgcolor="white",
+        xaxis=dict(range=[-7.0,7.0],showgrid=False,zeroline=False,showticklabels=False),
+        yaxis=dict(range=[-1.0,9.6],showgrid=False,zeroline=False,showticklabels=False),
+        showlegend=False, font=dict(family="Yu Gothic UI")
+    )
+    fig.add_annotation(x=-6.8,y=9.2,xref="x",yref="y",xanchor="left",
+        text="実線＝AIが自動で行う部分（ログに残る）　　点線枠＝人が確認・実行する部分",
+        showarrow=False,font=dict(size=13,color=MGRAY),align="left")
+
+    # 起点：請求書チェックで不一致を検知（1つの共有ノード。ここから4レーンへ分岐）
+    origin_y = 7.7
+    fig.add_shape(type="rect",x0=-2.6,y0=origin_y-BH,x1=2.6,y1=origin_y+BH,
+        fillcolor=ACCENT,line=dict(color="white",width=1.5),layer="above")
+    fig.add_annotation(x=0,y=origin_y,text="<b>請求書チェックで不一致を検知</b>",showarrow=False,
+        font=dict(size=15,color="white"),align="center")
+
+    ai_y, hu_y, done_y = 5.4, 2.7, 0.3
+    for exc,lx in lane_x.items():
+        cfg = EXC_TYPES[exc]; act = AI_ACTIONS[exc]
+        color = cfg["color"]
+
+        # 起点からレーンへ（直接の対角線のみ。他レーンと共有しない）
+        fig.add_annotation(x=lx,y=ai_y+BH,ax=0,ay=origin_y-BH,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=1.0,arrowwidth=2.2,arrowcolor=color,showarrow=True,text="")
+
+        fig.add_annotation(x=lx,y=ai_y+BH+0.35,text=f"<b>{exc}</b>",showarrow=False,
+            font=dict(size=13,color=color),align="center")
+
+        # AI下調べ（実線で接続＝自動）
+        fig.add_shape(type="rect",x0=lx-BW,y0=ai_y-BH,x1=lx+BW,y1=ai_y+BH,
+            fillcolor=color,line=dict(color="white",width=1.3),layer="above")
+        fig.add_annotation(x=lx,y=ai_y+0.25,text="<b>AI下調べ</b>",showarrow=False,
+            font=dict(size=12,color="white"),align="center")
+        fig.add_annotation(x=lx,y=ai_y-0.28,text=act["ai"],showarrow=False,
+            font=dict(size=10.8,color="rgba(255,255,255,0.95)"),align="center")
+
+        fig.add_annotation(x=lx,y=hu_y+BH,ax=lx,ay=ai_y-BH,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=1.0,arrowwidth=2.2,arrowcolor=color,showarrow=True,text="")
+
+        # 人が確認・実行（点線枠＝オフシステムの人手対応）
+        fig.add_shape(type="rect",x0=lx-BW,y0=hu_y-BH,x1=lx+BW,y1=hu_y+BH,
+            fillcolor="white",line=dict(color=color,width=2.6,dash="dot"),layer="above")
+        fig.add_annotation(x=lx,y=hu_y+0.25,text=f"<b>{cfg['dept']}が対応</b>",showarrow=False,
+            font=dict(size=12,color=color),align="center")
+        fig.add_annotation(x=lx,y=hu_y-0.28,text=act["human"],showarrow=False,
+            font=dict(size=10.8,color=SLATE),align="center")
+
+        fig.add_annotation(x=lx,y=done_y+0.35,ax=lx,ay=hu_y-BH,
+            xref="x",yref="y",axref="x",ayref="y",
+            arrowhead=2,arrowsize=0.9,arrowwidth=2.0,arrowcolor=color,showarrow=True,text="")
+        fig.add_annotation(x=lx,y=done_y,text="対応完了・<br>再チェックへ",showarrow=False,
+            font=dict(size=10.5,color=color),align="center")
+
+    return fig
+
+# ── 経理担当者向け照合チェックリスト（仮） ──────────────
+def build_checklist(fdf):
+    rows = []
+    for exc,cfg in EXC_TYPES.items():
+        act = AI_ACTIONS[exc]
+        ai_plain = act["ai"].replace("<br>","")
+        human_plain = act["human"].replace("<br>","")
+        rows.append({
+            "不一致区分": exc,
+            "AIが用意する情報": ai_plain,
+            "担当者が確認すること": human_plain,
+            "担当部署": cfg["dept"],
+        })
+    tbl = pd.DataFrame(rows)
+    return tbl
+
+
+
+def make_routing_chart(fdf):
+    exc = fdf[fdf["match_result"]!="一致"].copy()
+
+    def zone(row):
+        if row["po_amount"]<300000 and row["pattern_match"]>=0.6:
+            return "自動処理ゾーン"
+        elif row["pattern_match"]>=0.4:
+            return "AI推奨＋人が承認"
+        else:
+            return "人手調査ゾーン"
+    exc["zone"] = exc.apply(zone,axis=1)
+
+    colors = {"自動処理ゾーン":GREEN,"AI推奨＋人が承認":AMBER,"人手調査ゾーン":WARN}
+    fig = go.Figure()
+    for z,c in colors.items():
+        sub = exc[exc["zone"]==z]
+        fig.add_trace(go.Scatter(
+            x=sub["pattern_match"], y=sub["po_amount"], mode="markers",
+            marker=dict(color=c,size=8,opacity=0.65,line=dict(width=0)),
+            name=z,
+            hovertemplate="過去パターン一致度: %{x:.2f}<br>金額: ¥%{y:,.0f}<extra></extra>"
+        ))
+    fig.update_layout(
+        height=420, margin=dict(t=20,b=40,l=60,r=20),
+        paper_bgcolor="white", plot_bgcolor="white",
+        xaxis_title="過去の類似パターンとの一致度（低←→高）",
+        yaxis_title="請求金額（円）",
+        yaxis_type="log",
+        legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),
+        font=dict(family="Yu Gothic UI",size=12)
+    )
+    fig.update_xaxes(gridcolor="#EEF2F6",range=[0,1])
+    fig.update_yaxes(gridcolor="#EEF2F6")
+    return fig
 
 # ── SIDEBAR ───────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"<div style='font-size:22px;font-weight:700;color:{NAVY};'>"
                 f"NeXT<span style='color:{STEEL};'> Diagnostics</span></div>",
                 unsafe_allow_html=True)
-    st.caption("CG制作プロセス分析 Demo v3.0")
+    st.caption("支払業務プロセス分析 Demo v2.0")
     st.divider()
-    projs = ["全プロジェクト"] + sorted(df["project"].unique())
-    sel   = st.selectbox("プロジェクト選択", projs)
-    st.divider()
-    phase_sel = st.selectbox("業務手順ドリルダウン：工程選択", STAGES, index=2)
+    depts = ["全部門"] + sorted(df["buy_dept"].unique())
+    sel = st.selectbox("発注部門で絞り込み", depts)
     st.divider()
     api_key = st.text_input("Claude API Key", type="password", placeholder="sk-ant-...")
     st.caption("AI分析機能の利用に必要です")
 
-fdf = df if sel=="全プロジェクト" else df[df["project"]==sel]
+fdf = df if sel=="全部門" else df[df["buy_dept"]==sel]
 
 # ── TITLE ─────────────────────────────────────────────
-st.markdown("## 🎬 CG制作プロセス分析ダッシュボード")
-st.caption(f"{sel}　｜　{fdf['shot_id'].nunique():,} ショット　｜　"
-           f"工程: {' → '.join(STAGES[:4])} → …　｜　ShotGrid連携（デモデータ）")
+st.markdown("## 💰 支払業務プロセス分析ダッシュボード")
+st.caption(f"{sel}　｜　{len(fdf):,} 件の請求書処理　｜　発注 → 検収 → 請求書チェック → 支払　｜　デモデータ")
 
-# ── KPI ───────────────────────────────────────────────
-shots     = fdf["shot_id"].nunique()
-avg_delay = fdf.groupby("shot_id")["delay"].sum().mean()
-total_rev = int(fdf["revision"].sum())
-on_time   = (1-fdf.groupby("shot_id")["is_late"].any().mean())*100
-hold_rate_all = fdf.loc[fdf["stage"].map(lambda s: TASK_CONFIG[s]["upstream"] is not None),"hold"].mean()
+n_total = len(fdf)
+match_rate = (fdf["match_result"]=="一致").mean()*100
+exc_df = fdf[fdf["match_result"]!="一致"]
+avg_resolve = exc_df["resolve_days"].mean() if len(exc_df) else 0
 
-c1,c2,c3,c4,c5 = st.columns(5)
+c1,c2,c3,c4 = st.columns(4)
 for col,lbl,val,sub,cls in [
-    (c1,"分析ショット数",    f"{shots:,}",        "全工程のログを可視化",   ""),
-    (c2,"平均遅延日数",       f"{avg_delay:.1f}日", "ショットあたり合計遅延","kpi-w" if avg_delay>3 else ""),
-    (c3,"総リビジョン回数",  f"{total_rev:,}回",   "全工程・全ショット合計", "kpi-w"),
-    (c4,"期限内完了率",       f"{on_time:.0f}%",    "全ショット・全工程",     "kpi-g" if on_time>=70 else "kpi-w"),
-    (c5,"上流波及による保留率", f"{hold_rate_all:.0%}", "モデリング/レイアウト起点", "kpi-w" if hold_rate_all>0.15 else ""),
+    (c1,"総処理件数",       f"{n_total:,}件",     "分析対象の請求書処理",  ""),
+    (c2,"一発で一致する割合", f"{match_rate:.0f}%", "発注・検収・請求書が即一致","kpi-g" if match_rate>=55 else "kpi-w"),
+    (c3,"不一致件数",       f"{len(exc_df):,}件", "人の対応が必要な件数",  "kpi-w"),
+    (c4,"不一致の平均対応日数", f"{avg_resolve:.1f}日","一致から解決までの日数","kpi-w" if avg_resolve>3 else ""),
 ]:
     with col:
         st.markdown(f"<div class='kpi {cls}'><div class='kpi-lbl'>{lbl}</div>"
@@ -576,263 +418,126 @@ for col,lbl,val,sub,cls in [
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── DFG（俯瞰） + Bottleneck ───────────────────────────
-r2l, r2r = st.columns([3,2])
-
-with r2l:
-    st.markdown("<div class='sec'>プロセスフロー（工程レベル・俯瞰マップ）</div>",
-                unsafe_allow_html=True)
-    fig_dfg = make_dfg(fdf, STAGES)
-    st.plotly_chart(fig_dfg, use_container_width=True)
-
-with r2r:
-    st.markdown("<div class='sec'>工程別ボトルネック（計画比）</div>",
-                unsafe_allow_html=True)
-    ss = fdf.groupby("stage").agg(actual=("actual","mean"),planned=("planned","mean")).reset_index()
-    ss = ss[ss["stage"].isin(STAGES)]
-    ss["stage"] = pd.Categorical(ss["stage"],categories=STAGES,ordered=True)
-    ss = ss.sort_values("stage",ascending=True)
-    ss["pct"] = (ss["actual"]-ss["planned"])/ss["planned"]*100
-
-    fig_b = go.Figure(go.Bar(
-        y=ss["stage"], x=ss["pct"], orientation="h",
-        marker_color=[WARN if v>0 else GREEN for v in ss["pct"]],
-        text=[f"{v:+.0f}%" for v in ss["pct"]], textposition="outside",
-        hovertemplate="<b>%{y}</b><br>計画比: %{x:+.1f}%<extra></extra>"
-    ))
-    fig_b.add_vline(x=0,line_color=NAVY,line_width=1.5)
-    fig_b.update_layout(
-        height=390,margin=dict(t=8,b=8,l=10,r=65),
-        paper_bgcolor="white",plot_bgcolor="white",
-        xaxis_title="計画比（%）",
-        font=dict(family="Yu Gothic UI",size=11)
-    )
-    fig_b.update_xaxes(gridcolor="#EEF2F6")
-    st.plotly_chart(fig_b, use_container_width=True)
-
-# ── TASK-LEVEL DFG（工程内ドリルダウン） ────────────────
-st.markdown(f"<div class='sec'>業務手順レベルのプロセスフロー（工程内ドリルダウン：{phase_sel}）</div>",
+# ── ① 現状可視化 ───────────────────────────────────────
+st.markdown("<div class='sec'><span class='stepnum'>1</span>現状プロセスの可視化（プロセスマイニング）</div>",
             unsafe_allow_html=True)
-st.markdown("<div class='subsec'>ShotGrid等のタスク管理ツールを想定した粒度：作業 → 内部レビュー → "
-            "（差し戻し／保留／クライアントレビュー）→ 承認 の実態フローを可視化</div>",
+st.markdown("<div class='subsec'>実際の処理データから、そのままの姿を可視化。この段階ではAIは使っていない</div>",
             unsafe_allow_html=True)
-sdf_task = fdf[fdf["stage"]==phase_sel]
-fig_task = make_task_dfg(phase_sel, sdf_task)
-st.plotly_chart(fig_task, use_container_width=True)
+st.plotly_chart(make_asis_flow(fdf), use_container_width=True)
 
-st.markdown("<div class='subsec' style='margin-top:4px'>工程別イベント件数・スループット"
-            "（頻度はループによる再訪問を含む／プロセスマイニングの標準指標）</div>",
+# ── ② 影響のまとめ ─────────────────────────────────────
+st.markdown("<div class='sec'><span class='stepnum'>2</span>課題による影響のまとめ</div>",
             unsafe_allow_html=True)
-tbl = build_task_table(phase_sel, sdf_task)
-st.dataframe(tbl, hide_index=True, use_container_width=True)
+impact_tbl = build_impact_table(fdf)
+st.dataframe(impact_tbl, hide_index=True, use_container_width=True)
 
-if phase_sel=="リギング":
-    st.markdown("<div class='subsec' style='margin-top:14px'>リギング特化インサイト："
-                "実際のタスク管理ツールで検出できる3つの差し戻し要因＋通常は見えない「逆流」パターン</div>",
-                unsafe_allow_html=True)
-    rg = sdf_task
-    w_rate = (rg["rework_cause"]=="ウェイト不良").mean()
-    c_rate = (rg["rework_cause"]=="補正シェイプ不足").mean()
-    v_rate = (rg["rework_cause"]=="検証NG").mean()
-    r_rate = rg["downstream_recall"].mean()
+total_stuck = impact_tbl["滞留金額合計"].sum()
+total_days = impact_tbl["延べ対応日数"].sum()
+worst = impact_tbl.loc[impact_tbl["延べ対応日数"].idxmax()]
 
-    rg1,rg2,rg3,rg4 = st.columns(4)
-    with rg1:
-        st.markdown(f"""<div class='issue-card'>
-            <div class='issue-title'>ウェイト不良</div>
-            <div class='issue-body'>差し戻し率 <span class='issue-num'>{w_rate:.0%}</span><br>
-            スキニング工程の品質ばらつきが最大の手戻り要因。ウェイトペイントの標準化・
-            レビュー観点の明文化が効果的。</div></div>""", unsafe_allow_html=True)
-    with rg2:
-        st.markdown(f"""<div class='issue-card'>
-            <div class='issue-title'>補正シェイプ不足</div>
-            <div class='issue-body'>差し戻し率 <span class='issue-num'>{c_rate:.0%}</span><br>
-            肘・膝・肩などの局所的な変形破綻。ストレスポーズでの
-            早期検証が手戻り削減の鍵。</div></div>""", unsafe_allow_html=True)
-    with rg3:
-        st.markdown(f"""<div class='issue-card'>
-            <div class='issue-title'>検証NG(命名/性能)</div>
-            <div class='issue-body'>差し戻し率 <span class='issue-num'>{v_rate:.0%}</span><br>
-            命名規則違反・参照エラー・パフォーマンス予算超過。
-            自動チェックスクリプトで人手レビュー前に検出可能。</div></div>""", unsafe_allow_html=True)
-    with rg4:
-        st.markdown(f"""<div class='issue-card' style='border-top-color:{ACCENT}'>
-            <div class='issue-title'>逆流(アニメーション工程から)</div>
-            <div class='issue-body'>発生率 <span class='issue-num'>{r_rate:.0%}</span><br>
-            パブリッシュ後、実際にアニメーターが動かして初めて発覚する不具合。
-            通常のガントチャートでは見えず、プロセスマイニングで初めて可視化できる部分。</div></div>""",
-            unsafe_allow_html=True)
-
-# ── CG業界特有の経営課題 ────────────────────────────────
-st.markdown("<div class='sec'>CG業界特有の経営課題（データから検出）</div>", unsafe_allow_html=True)
-
-by_artist = fdf.groupby("artist").agg(n=("shot_id","nunique"),
-                                       late_rate=("is_late","mean")).reset_index()
-top_artist = by_artist.sort_values("n",ascending=False).iloc[0]
-
-crev = fdf[fdf["client_review"]]
-c_reject_rate = crev["client_reject"].mean() if len(crev) else 0.0
-c_extra_days  = crev.loc[crev["client_reject"],"client_days"].mean() if crev["client_reject"].any() else 0.0
-
-hold_df = fdf[fdf["stage"].map(lambda s: TASK_CONFIG[s]["upstream"] is not None)]
-hold_rate2 = hold_df["hold"].mean()
-hold_days_avg = hold_df.loc[hold_df["hold"],"hold_days"].mean() if hold_df["hold"].any() else 0.0
-
-anim = fdf[fdf["stage"]=="アニメーション"]
-anim_total_extra = anim["delay"].mean()
-
-i1,i2,i3,i4 = st.columns(4)
+i1,i2,i3 = st.columns(3)
 with i1:
     st.markdown(f"""<div class='issue-card'>
-        <div class='issue-title'>属人化リスク</div>
-        <div class='issue-body'><span class='issue-num'>{top_artist['artist']}</span>に
-        担当ショットが集中。特定アーティスト依存度が高い工程は、その人物の離脱・多忙が
-        全体スケジュールに直結する。</div></div>""", unsafe_allow_html=True)
+        <div class='issue-title'>滞留している金額</div>
+        <div class='issue-body'><span class='issue-num'>¥{total_stuck:,.0f}</span><br>
+        不一致のまま処理が止まっている請求書の合計金額。支払遅延や資金繰りに直結する。</div></div>""",
+        unsafe_allow_html=True)
 with i2:
     st.markdown(f"""<div class='issue-card'>
-        <div class='issue-title'>クライアントレビュー往復コスト</div>
-        <div class='issue-body'>クライアント差し戻し率
-        <span class='issue-num'>{c_reject_rate:.0%}</span>。
-        1回の差し戻しで平均{c_extra_days:.1f}日の追加が発生し、外部要因による
-        スケジュール遅延の主因になりやすい。</div></div>""", unsafe_allow_html=True)
+        <div class='issue-title'>最も負荷の大きいパターン</div>
+        <div class='issue-body'><span class='issue-num'>{worst['不一致パターン']}</span><br>
+        延べ{worst['延べ対応日数']:.0f}日分の対応工数が発生（{worst['対応部署']}）。
+        優先的に手を打つべき箇所。</div></div>""", unsafe_allow_html=True)
 with i3:
     st.markdown(f"""<div class='issue-card'>
-        <div class='issue-title'>上流変更の下流波及</div>
-        <div class='issue-body'>モデリング／レイアウトの手戻りが下流工程の
-        <span class='issue-num'>{hold_rate2:.0%}</span>で保留（平均{hold_days_avg:.1f}日）を誘発。
-        並行作業の前提が崩れ、見えない停滞を生む。</div></div>""", unsafe_allow_html=True)
-with i4:
-    st.markdown(f"""<div class='issue-card'>
-        <div class='issue-title'>アニメーション工程の複合リスク</div>
-        <div class='issue-body'>内部差し戻し・保留・クライアント差し戻しが重なりやすく、
-        平均<span class='issue-num'>{anim_total_extra:.1f}日</span>の遅延が集中。
-        単一工程だが実質的に最大のボトルネック。</div></div>""", unsafe_allow_html=True)
+        <div class='issue-title'>合計の対応工数</div>
+        <div class='issue-body'><span class='issue-num'>{total_days:.0f}日</span><br>
+        不一致対応にかかっている延べ日数の合計。人手で吸収してきた"見えないコスト"。</div></div>""",
+        unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Heatmap + Histogram ───────────────────────────────
-r3l, r3r = st.columns([3,2])
-
-with r3l:
-    st.markdown("<div class='sec'>アーティスト × 工程　平均リビジョン回数</div>",
-                unsafe_allow_html=True)
-    hp = fdf.groupby(["artist","stage"])["revision"].mean().reset_index()
-    pv = hp.pivot(index="artist",columns="stage",values="revision").fillna(0)
-    pv = pv[[s for s in STAGES if s in pv.columns]]
-    fig_h = go.Figure(go.Heatmap(
-        z=pv.values, x=pv.columns.tolist(), y=pv.index.tolist(),
-        colorscale=[[0,PALE],[0.4,STEEL],[1,WARN]],
-        hovertemplate="<b>%{y} × %{x}</b><br>平均: %{z:.2f}回<extra></extra>",
-        text=np.round(pv.values,1), texttemplate="%{text}",
-        textfont=dict(size=10)
-    ))
-    fig_h.update_layout(height=290,margin=dict(t=8,b=8,l=10,r=10),
-                        paper_bgcolor="white",
-                        font=dict(family="Yu Gothic UI",size=10))
-    st.plotly_chart(fig_h, use_container_width=True)
-
-with r3r:
-    st.markdown("<div class='sec'>ショット別　遅延日数の分布</div>",
-                unsafe_allow_html=True)
-    sd2 = fdf.groupby("shot_id")["delay"].sum().reset_index()
-    avg_d = sd2["delay"].mean()
-    fig_hist = px.histogram(sd2,x="delay",nbins=25,
-        color_discrete_sequence=[STEEL],
-        labels={"delay":"合計遅延日数","count":"ショット数"})
-    fig_hist.add_vline(x=avg_d,line_dash="dash",line_color=WARN,
-        annotation_text=f"平均 {avg_d:.1f}日",
-        annotation_font_color=WARN,annotation_position="top right")
-    fig_hist.update_layout(height=290,margin=dict(t=8,b=8,l=10,r=10),
-        paper_bgcolor="white",plot_bgcolor="white",bargap=0.08,
-        font=dict(family="Yu Gothic UI",size=11))
-    fig_hist.update_yaxes(gridcolor="#EEF2F6")
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-# ── AI ANALYSIS ───────────────────────────────────────
-st.markdown("<div class='sec'>🤖 AI プロセス診断（Claude API）</div>",
+# ── ③ AIを使った効率化 ─────────────────────────────────
+st.markdown("<div class='sec'><span class='stepnum'>3</span>AIを使った効率化（改善提案）</div>",
             unsafe_allow_html=True)
+st.markdown("<div class='subsec'>①②で見えた課題に対して、AIが「差異の特定・情報整理・下調べ」まで行い、"
+            "人は最終確認と、AIも判断できない案件の調査だけを行う、という役割分担のイメージ</div>",
+            unsafe_allow_html=True)
+st.plotly_chart(make_tobe_flow(fdf), use_container_width=True)
+
+st.markdown("<div class='subsec' style='margin-top:10px'>経理担当者向け 照合チェックリスト（仮）</div>",
+            unsafe_allow_html=True)
+st.dataframe(build_checklist(fdf), hide_index=True, use_container_width=True)
+
+st.markdown("<div class='subsec' style='margin-top:14px'>参考：金額 × 過去パターンとの一致度で、"
+            "自動処理／AI推奨＋人承認／人手調査、に仕分ける考え方</div>", unsafe_allow_html=True)
+st.plotly_chart(make_routing_chart(fdf), use_container_width=True)
+
+r1,r2,r3 = st.columns(3)
+with r1:
+    st.markdown(f"""<div class='issue-card' style='border-top-color:{GREEN}'>
+        <div class='issue-title'>自動処理ゾーン</div>
+        <div class='issue-body'>少額かつ過去に何度も見たパターン。AIが下調べから解決案の適用まで
+        完結し、人は事後サンプリングでチェックするだけで良い。</div></div>""", unsafe_allow_html=True)
+with r2:
+    st.markdown(f"""<div class='issue-card' style='border-top-color:{AMBER}'>
+        <div class='issue-title'>AI推奨＋人が承認</div>
+        <div class='issue-body'>AIが下調べ・ドラフトまで作成するが、最終判断と送信は必ず人が行う。</div></div>""",
+        unsafe_allow_html=True)
+with r3:
+    st.markdown(f"""<div class='issue-card' style='border-top-color:{WARN}'>
+        <div class='issue-title'>人手調査ゾーン</div>
+        <div class='issue-body'>高額、または過去に類似パターンがない初見のケース。
+        AIに任せず、担当者が一から事実確認する。</div></div>""", unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ── AI診断 ────────────────────────────────────────────
+st.markdown("<div class='sec'>🤖 AI プロセス診断（Claude API）</div>", unsafe_allow_html=True)
 
 if st.button("▶ AI診断を実行", type="primary"):
     if not api_key:
         st.warning("サイドバーにClaude API Keyを入力してください。")
     else:
-        ss2 = fdf.groupby("stage").agg(
-            avg_actual =("actual","mean"),
-            avg_planned=("planned","mean"),
-            rev_rate   =("revision",lambda x:(x>0).mean()),
-            avg_rev    =("revision","mean"),
-        ).round(2).reset_index()
-        ss2 = ss2[ss2["stage"].isin(STAGES)]
+        prompt = f"""あなたは経理・内部統制に詳しいプロセス改善コンサルタントです。
+以下の支払業務プロセスのデータを分析し、日本語で経営者向け診断レポートを作成してください。
 
-        top5 = fdf.groupby("shot_id").agg(
-            total_delay=("delay","sum"),
-            project    =("project","first"),
-            complexity =("complexity","first"),
-        ).nlargest(5,"total_delay").reset_index()
+【対象】{sel}
+【総処理件数】{n_total}件　【一発一致率】{match_rate:.0f}%
+【不一致件数】{len(exc_df)}件　【平均対応日数】{avg_resolve:.1f}日
+【滞留金額合計】¥{total_stuck:,.0f}　【延べ対応日数】{total_days:.0f}日
 
-        prompt = f"""あなたはCG制作プロダクションのプロセス改善コンサルタントです。
-以下のデータを分析し、日本語で経営者向け診断レポートを作成してください。
-
-【分析対象】{sel}
-【ショット総数】{shots}件　【平均遅延】{avg_delay:.1f}日/ショット
-【総リビジョン】{total_rev}回　【期限内完了率】{on_time:.0f}%
-
-【工程】{" → ".join(STAGES)}
-
-【工程別パフォーマンス】
-{ss2.to_string(index=False)}
-
-【業界特有の経営課題（検出値）】
-・属人化：{top_artist['artist']} にショットが集中
-・クライアントレビュー差し戻し率：{c_reject_rate:.0%}（平均{c_extra_days:.1f}日/回の追加）
-・上流工程の手戻りによる下流保留率：{hold_rate2:.0%}（平均{hold_days_avg:.1f}日/件）
-
-【リギング工程：差し戻し要因の内訳】
-・ウェイト不良（スキニング起因）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='ウェイト不良').mean():.0%}
-・補正シェイプ不足（デフォーメーション破綻）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='補正シェイプ不足').mean():.0%}
-・検証NG（命名/性能）：{(fdf[fdf['stage']=='リギング']['rework_cause']=='検証NG').mean():.0%}
-・アニメーション工程からの逆流（パブリッシュ後の事後差し戻し）：{fdf[fdf['stage']=='リギング']['downstream_recall'].mean():.0%}
-
-【遅延上位5ショット】
-{top5.to_string(index=False)}
+【パターン別の内訳】
+{impact_tbl.to_string(index=False)}
 
 以下の構成で簡潔・具体的に答えてください：
 
-## 🔍 最重要ボトルネック
-（1〜2工程を具体的に。数値を使って）
-
-## 📊 遅延の根本原因
-（データから読み取れる構造的な問題を2〜3点。属人化・クライアントレビュー往復・上流波及のいずれかに触れること）
-
-## ✅ 即実行できる改善アクション
-（3つ。各1〜2文で）
-
-## ⚠️ 納期リスク評価
-（高/中/低とその根拠を1〜2文で）"""
+## 🔍 最も改善余地の大きいパターン
+## 📊 構造的な原因
+## ✅ 即実行できる改善アクション（3つ）
+## ⚠️ 資金繰り・支払遅延リスクの評価"""
 
         with st.spinner("Claudeが分析中...（10〜20秒）"):
             try:
                 resp = requests.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={"Content-Type":"application/json",
-                             "x-api-key":api_key,
+                    headers={"Content-Type":"application/json","x-api-key":api_key,
                              "anthropic-version":"2023-06-01"},
                     json={"model":"claude-sonnet-4-6","max_tokens":1200,
                           "messages":[{"role":"user","content":prompt}]},
                     timeout=40
                 )
                 if resp.status_code==200:
-                    st.markdown(
-                        f"<div class='ai-box'>{resp.json()['content'][0]['text']}</div>",
-                        unsafe_allow_html=True)
+                    st.markdown(f"<div class='ai-box'>{resp.json()['content'][0]['text']}</div>",
+                                unsafe_allow_html=True)
                 else:
                     st.error(f"APIエラー {resp.status_code}: {resp.text}")
             except Exception as e:
                 st.error(f"エラー: {e}")
 else:
     st.markdown(f"""<div class='hint'>▶ ボタンを押すと Claudeがプロセスデータを分析し、
-    <b>ボトルネック特定・根本原因（属人化／クライアントレビュー往復／上流波及を含む）・改善アクション・納期リスク評価</b>を自動生成します。
+    <b>改善余地の大きいパターン・構造的原因・改善アクション・資金リスク評価</b>を自動生成します。
     サイドバーにClaude API Keyが必要です。</div>""", unsafe_allow_html=True)
 
 st.divider()
-st.caption("NeXT Diagnostics Demo v3.0　｜　工程レベル俯瞰＋業務手順レベルのドリルダウン対応　｜　データはデモ用サンプルです")
+st.caption("NeXT Diagnostics Demo v2.0（支払業務）｜ データはデモ用サンプルです")
